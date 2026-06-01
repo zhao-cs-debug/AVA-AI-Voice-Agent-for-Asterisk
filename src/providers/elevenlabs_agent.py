@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import audioop
+import uuid
 from ..audio.resampler import resample_audio
 import struct
 from typing import Any, Callable, Dict, List, Optional
@@ -78,6 +79,10 @@ class ElevenLabsAgentProvider(AIProviderInterface, ProviderCapabilitiesMixin):
         self._closing = False
         self._closed = False
         self._in_audio_burst: bool = False
+        self._current_segment_id: Optional[str] = None
+        self._pending_agent_segment_ids: List[str] = []
+        self._audio_done_task: Optional[asyncio.Task] = None
+        self._audio_done_delay_sec = float(os.getenv("ELEVENLABS_AUDIO_DONE_DELAY_SEC", "1.0") or "1.0")
         
         # Audio resampling state
         self._resample_state_in = None  # For input resampling
@@ -143,6 +148,11 @@ class ElevenLabsAgentProvider(AIProviderInterface, ProviderCapabilitiesMixin):
         self._keepalive_task = None
         self._resample_state_in = None
         self._resample_state_out = None
+        self._current_segment_id = None
+        self._pending_agent_segment_ids = []
+        if self._audio_done_task and not self._audio_done_task.done():
+            self._audio_done_task.cancel()
+        self._audio_done_task = None
         
         if on_event:
             self.on_event = on_event
@@ -379,11 +389,15 @@ class ElevenLabsAgentProvider(AIProviderInterface, ProviderCapabilitiesMixin):
             # Emit final AgentAudioDone if we were mid-burst
             if self._in_audio_burst and self.on_event:
                 self._in_audio_burst = False
+                if self._audio_done_task and not self._audio_done_task.done():
+                    self._audio_done_task.cancel()
+                    self._audio_done_task = None
                 try:
                     await self.on_event({
                         "type": "AgentAudioDone",
                         "call_id": self._call_id,
                         "streaming_done": True,
+                        "segment_id": self._current_segment_id,
                     })
                 except Exception:
                     logger.debug(f"[elevenlabs] [{self._call_id}] Failed to emit AgentAudioDone during stop_session")
@@ -437,6 +451,9 @@ class ElevenLabsAgentProvider(AIProviderInterface, ProviderCapabilitiesMixin):
             self._closing = False
             self._closed = True
             self._in_audio_burst = False
+            self._current_segment_id = None
+            self._pending_agent_segment_ids = []
+            self._audio_done_task = None
     
     async def _receive_loop(self) -> None:
         """Process incoming WebSocket messages from ElevenLabs."""
@@ -584,6 +601,12 @@ class ElevenLabsAgentProvider(AIProviderInterface, ProviderCapabilitiesMixin):
         output_audio = self._convert_output_audio(pcm16_audio)
         
         self._in_audio_burst = True
+        if not self._current_segment_id:
+            if self._pending_agent_segment_ids:
+                self._current_segment_id = self._pending_agent_segment_ids.pop(0)
+            else:
+                self._current_segment_id = self._new_segment_id()
+        self._schedule_audio_done()
         # Emit audio event
         await self.on_event({
             "type": "AgentAudio",
@@ -591,6 +614,7 @@ class ElevenLabsAgentProvider(AIProviderInterface, ProviderCapabilitiesMixin):
             "data": output_audio,
             "encoding": self.config.target_encoding,
             "sample_rate": self.config.target_sample_rate_hz,
+            "segment_id": self._current_segment_id,
         })
     
     def _convert_output_audio(self, pcm16_audio: bytes) -> bytes:
@@ -622,6 +646,10 @@ class ElevenLabsAgentProvider(AIProviderInterface, ProviderCapabilitiesMixin):
         text = response.get("agent_response", "")
         
         if text:
+            segment_id = self._current_segment_id
+            if not segment_id:
+                segment_id = self._new_segment_id()
+                self._pending_agent_segment_ids.append(segment_id)
             logger.debug(f"[elevenlabs] [{self._call_id}] Agent: {text[:100]}...")
             
             await self.on_event({
@@ -629,7 +657,34 @@ class ElevenLabsAgentProvider(AIProviderInterface, ProviderCapabilitiesMixin):
                 "call_id": self._call_id,
                 "text": text,
                 "role": "assistant",
+                "segment_id": segment_id,
             })
+
+    def _new_segment_id(self) -> str:
+        return f"{self._call_id}:assistant:{uuid.uuid4().hex[:12]}"
+
+    def _schedule_audio_done(self) -> None:
+        if self._audio_done_task and not self._audio_done_task.done():
+            self._audio_done_task.cancel()
+        self._audio_done_task = asyncio.create_task(self._emit_audio_done_after_delay(self._current_segment_id))
+
+    async def _emit_audio_done_after_delay(self, segment_id: Optional[str]) -> None:
+        try:
+            await asyncio.sleep(max(0.05, self._audio_done_delay_sec))
+            if not self._in_audio_burst or segment_id != self._current_segment_id:
+                return
+            self._in_audio_burst = False
+            await self.on_event({
+                "type": "AgentAudioDone",
+                "call_id": self._call_id,
+                "streaming_done": True,
+                "segment_id": segment_id,
+            })
+            self._current_segment_id = None
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.debug(f"[elevenlabs] [{self._call_id}] Failed to emit delayed AgentAudioDone", exc_info=True)
     
     async def _handle_user_transcript(self, data: Dict[str, Any]) -> None:
         """Handle user transcript (STT result)."""
@@ -691,14 +746,19 @@ class ElevenLabsAgentProvider(AIProviderInterface, ProviderCapabilitiesMixin):
         # Signal end of audio burst on interruption
         if self._in_audio_burst and self.on_event:
             self._in_audio_burst = False
+            if self._audio_done_task and not self._audio_done_task.done():
+                self._audio_done_task.cancel()
+                self._audio_done_task = None
             try:
                 await self.on_event({
                     "type": "AgentAudioDone",
                     "call_id": self._call_id,
                     "streaming_done": True,
+                    "segment_id": self._current_segment_id,
                 })
             except Exception:
                 logger.debug(f"[elevenlabs] [{self._call_id}] Failed to emit AgentAudioDone on interruption")
+            self._current_segment_id = None
         
         await self.on_event({
             "type": "interruption",

@@ -114,7 +114,7 @@ if _is_remote_bind and _raw_jwt_secret in _placeholder_secrets:
         _uvicorn_host,
     )
 
-from api import config, system, wizard, logs, local_ai, ollama, mcp, calls, outbound, tools, docs, custom_models  # noqa: E402
+from api import config, system, wizard, logs, local_ai, ollama, mcp, calls, outbound, tools, docs, custom_models, voice_library  # noqa: E402
 import auth  # noqa: E402
 
 # Allow disabling API docs in production for security hardening
@@ -161,6 +161,7 @@ Most endpoints require JWT authentication. Obtain a token via `POST /api/auth/lo
         {"name": "system", "description": "System operations, containers, updates, health"},
         {"name": "wizard", "description": "Setup wizard and local AI model downloads"},
         {"name": "local-ai", "description": "Local AI server management"},
+        {"name": "voice-library", "description": "HiFi voice library proxy"},
         {"name": "calls", "description": "Call history and analytics"},
         {"name": "outbound", "description": "Outbound campaigns and lead management"},
         {"name": "tools", "description": "Tool catalog and HTTP tool testing"},
@@ -215,6 +216,7 @@ app.include_router(system.router, prefix="/api/system", tags=["system"], depende
 app.include_router(wizard.router, prefix="/api/wizard", tags=["wizard"], dependencies=[Depends(auth.get_current_user)])
 app.include_router(logs.router, prefix="/api/logs", tags=["logs"], dependencies=[Depends(auth.get_current_user)])
 app.include_router(local_ai.router, prefix="/api/local-ai", tags=["local-ai"], dependencies=[Depends(auth.get_current_user)])
+app.include_router(voice_library.router, prefix="/api", tags=["voice-library"], dependencies=[Depends(auth.get_current_user)])
 app.include_router(mcp.router, dependencies=[Depends(auth.get_current_user)])
 app.include_router(ollama.router, tags=["ollama"], dependencies=[Depends(auth.get_current_user)])
 app.include_router(calls.router, prefix="/api", tags=["calls"], dependencies=[Depends(auth.get_current_user)])

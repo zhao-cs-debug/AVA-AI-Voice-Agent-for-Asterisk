@@ -1526,7 +1526,7 @@ providers:
     provider_input_encoding: linear16
     provider_input_sample_rate_hz: 16000
     response_modalities: audio
-    target_encoding: ulaw
+    target_encoding: slin
     target_sample_rate_hz: 8000
     tts_voice_name: Aoede
     type: full

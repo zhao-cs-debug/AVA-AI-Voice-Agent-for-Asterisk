@@ -20,6 +20,7 @@ import ContextsPage from './pages/ContextsPage';
 import ProfilesPage from './pages/ProfilesPage';
 import ToolsPage from './pages/ToolsPage';
 import MCPPage from './pages/MCPPage';
+import VoiceLibraryPage from './pages/VoiceLibraryPage';
 
 // Advanced Configuration Pages
 import VADPage from './pages/Advanced/VADPage';
@@ -144,6 +145,7 @@ function App() {
                                             <Route path="/pipelines" element={<PipelinesPage />} />
                                             <Route path="/contexts" element={<ContextsPage />} />
                                             <Route path="/profiles" element={<ProfilesPage />} />
+                                            <Route path="/voice-library" element={<VoiceLibraryPage />} />
                                             <Route path="/tools" element={<ToolsPage />} />
                                             <Route path="/mcp" element={<MCPPage />} />
 

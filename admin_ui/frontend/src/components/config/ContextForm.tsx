@@ -38,6 +38,15 @@ const ContextForm = ({ config, providers, pipelines, availableTools, toolEnabled
         onChange({ ...config, ...patch });
     };
 
+    const updateDefaultVoice = (field: 'voice_id' | 'voice_revision_id' | 'hifi_id', value: string) => {
+        const current = (config.default_voice && typeof config.default_voice === 'object') ? config.default_voice : {};
+        const next = { ...current, [field]: value.trim() };
+        Object.keys(next).forEach((key) => {
+            if (!next[key]) delete next[key];
+        });
+        updateConfig('default_voice', next.voice_id ? next : undefined);
+    };
+
     const matchesHttpToolPhase = (tool: any, phase: 'pre_call' | 'post_call' | 'in_call') => {
         if (!tool || typeof tool !== 'object' || !tool.kind) return false;
         if (phase === 'in_call') {
@@ -308,6 +317,37 @@ const ContextForm = ({ config, providers, pipelines, availableTools, toolEnabled
                     value={overrideValue}
                     onChange={(e) => handleOverrideChange(e.target.value)}
                 />
+            </div>
+
+            <div className="p-4 border border-border rounded-lg bg-card/30">
+                <div className="mb-3">
+                    <FormLabel tooltip="Optional. When set, local_ai_server TTS requests include voice.voice_id so B can use the HiFi voice library.">
+                        Default HiFi Voice
+                    </FormLabel>
+                    <p className="text-xs text-muted-foreground">
+                        Leave empty to keep the legacy TTS flow unchanged.
+                    </p>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <FormInput
+                        label="voice_id"
+                        value={config.default_voice?.voice_id || ''}
+                        onChange={(e) => updateDefaultVoice('voice_id', e.target.value)}
+                        placeholder="voice_..."
+                    />
+                    <FormInput
+                        label="voice_revision_id"
+                        value={config.default_voice?.voice_revision_id || ''}
+                        onChange={(e) => updateDefaultVoice('voice_revision_id', e.target.value)}
+                        placeholder="vrev_... (optional)"
+                    />
+                    <FormInput
+                        label="hifi_id"
+                        value={config.default_voice?.hifi_id || ''}
+                        onChange={(e) => updateDefaultVoice('hifi_id', e.target.value)}
+                        placeholder="optional cache id"
+                    />
+                </div>
             </div>
 
             {/* Phase-Based Tool Configuration */}

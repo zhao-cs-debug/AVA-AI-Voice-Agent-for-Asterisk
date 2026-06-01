@@ -45,6 +45,17 @@ def _merge_dicts(base: Dict[str, Any], override: Optional[Dict[str, Any]]) -> Di
     return merged
 
 
+def _normalize_voice(voice: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:
+    if not isinstance(voice, dict):
+        return None
+    normalized: Dict[str, str] = {}
+    for key in ("voice_id", "voice_revision_id", "hifi_id"):
+        value = str(voice.get(key) or "").strip()
+        if value:
+            normalized[key] = value
+    return normalized if normalized.get("voice_id") else None
+
+
 @dataclass
 class _LocalSessionState:
     websocket: ClientConnection
@@ -1137,6 +1148,9 @@ class LocalTTSAdapter(_LocalAdapterBase, TTSComponent):
             "mode": "tts",
             "text": text,
         }
+        voice = _normalize_voice(merged.get("default_voice") or merged.get("voice"))
+        if voice:
+            payload["voice"] = voice
 
         # Use retry logic for TTS send
         try:

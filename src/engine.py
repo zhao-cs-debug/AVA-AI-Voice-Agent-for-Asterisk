@@ -34,7 +34,7 @@ except ImportError:
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest, Histogram, Counter, Gauge
 
 from .ari_client import ARIClient
-from aiohttp import web
+from aiohttp import ClientSession, web
 from pydantic import ValidationError
 
 from .config import (
@@ -289,6 +289,15 @@ class Engine:
         self._outbound_dial_prefix = str(os.getenv("AAVA_OUTBOUND_DIAL_PREFIX", "")).strip()
         self._outbound_channel_tech = str(os.getenv("AAVA_OUTBOUND_CHANNEL_TECH", "auto")).strip().lower() or "auto"
         self._outbound_pbx_type = str(os.getenv("AAVA_OUTBOUND_PBX_TYPE", "freepbx")).strip().lower() or "freepbx"
+        self._voiceai_backend_base_url = str(os.getenv("VOICEAI_BACKEND_BASE_URL", "http://127.0.0.1:8000")).rstrip("/")
+        self._voiceai_backend_token = str(os.getenv("VOICEAI_BACKEND_AUTH_TOKEN") or os.getenv("LOCAL_WS_AUTH_TOKEN") or "").strip()
+        self._voiceai_audio_monitor_enabled = str(os.getenv("VOICEAI_AUDIO_MONITOR_ENABLED", "1")).lower() not in ("0", "false", "no")
+        self._voiceai_audio_monitor_min_bytes = int(os.getenv("VOICEAI_AUDIO_MONITOR_MIN_BYTES", "16000") or "16000")
+        self._voiceai_audio_monitor_buffers: Dict[str, bytearray] = {}
+        self._voiceai_audio_monitor_buffer_segments: Dict[str, str] = {}
+        self._voiceai_assistant_segment_ids: Dict[str, str] = {}
+        self._voiceai_last_assistant_segment_ids: Dict[str, str] = {}
+        self._voiceai_last_assistant_segment_done_ts: Dict[str, float] = {}
         
         # Initialize streaming playback manager
         streaming_config = {}
@@ -4497,6 +4506,18 @@ class Engine:
             if not ws_url:
                 return None
             auth_token = str(local_cfg.get("auth_token") or "").strip() or None
+            default_voice = None
+            try:
+                session = await self.session_store.get_by_call_id(call_id)
+                overrides = dict(getattr(session, "provider_overrides", {}) or {}) if session else {}
+                candidate = overrides.get("default_voice") or local_cfg.get("default_voice")
+                if isinstance(candidate, dict) and candidate.get("voice_id"):
+                    default_voice = {
+                        k: v for k, v in candidate.items()
+                        if k in ("voice_id", "voice_revision_id", "hifi_id") and v
+                    }
+            except Exception:
+                default_voice = None
             deadline = time.time() + max(0.1, float(timeout_sec))
 
             async with websockets.connect(ws_url, open_timeout=float(timeout_sec), ping_interval=None) as ws:
@@ -4594,16 +4615,16 @@ class Engine:
                     deadline=deadline,
                 ):
                     return None
-                await ws.send(
-                    json.dumps(
-                        {
-                            "type": "tts_request",
-                            "text": text,
-                            "call_id": call_id,
-                            "response_format": "json",
-                        }
-                    )
-                )
+                payload = {
+                    "type": "tts_request",
+                    "mode": "tts",
+                    "text": text,
+                    "call_id": call_id,
+                    "response_format": "json",
+                }
+                if default_voice:
+                    payload["voice"] = default_voice
+                await ws.send(json.dumps(payload))
                 while time.time() < deadline:
                     msg = await asyncio.wait_for(ws.recv(), timeout=max(0.1, float(deadline - time.time())))
                     if isinstance(msg, bytes):
@@ -6825,6 +6846,16 @@ class Engine:
                                 pcm16 = pcm_bytes
                         if pcm16:
                             q.put_nowait(pcm16)
+                            try:
+                                await self._publish_audio_to_voiceai(
+                                    caller_channel_id,
+                                    pcm16,
+                                    role="user",
+                                    encoding="slin",
+                                    sample_rate=16000,
+                                )
+                            except Exception:
+                                logger.debug("VoiceAI user audio publish failed (AudioSocket/pipeline)", call_id=caller_channel_id, exc_info=True)
                         return
                     except asyncio.QueueFull:
                         logger.debug("Pipeline queue full; dropping AudioSocket frame", call_id=caller_channel_id)
@@ -7023,6 +7054,16 @@ class Engine:
                             call_id=session.call_id,
                             exc_info=True,
                         )
+                    try:
+                        await self._publish_audio_to_voiceai(
+                            caller_channel_id,
+                            prov_payload,
+                            role="user",
+                            encoding=prov_enc,
+                            sample_rate=prov_rate,
+                        )
+                    except Exception:
+                        logger.debug("VoiceAI user audio publish failed (AudioSocket/provider)", call_id=caller_channel_id, exc_info=True)
 
                     # CRITICAL: Pass sample_rate and encoding to prevent double resampling
                     # Google Live needs to know audio is already at provider_rate to skip resampling
@@ -8336,6 +8377,16 @@ class Engine:
                 if q:
                     try:
                         q.put_nowait(pcm_16k)  # Pipeline expects PCM16@16kHz
+                        try:
+                            await self._publish_audio_to_voiceai(
+                                caller_channel_id,
+                                pcm_16k,
+                                role="user",
+                                encoding="slin",
+                                sample_rate=16000,
+                            )
+                        except Exception:
+                            logger.debug("VoiceAI user audio publish failed (RTP/pipeline)", call_id=caller_channel_id, exc_info=True)
                         logger.debug("RTP audio routed to pipeline queue", call_id=caller_channel_id, bytes=len(pcm_16k))
                     except Exception as exc:
                         logger.warning("Pipeline queue full or unavailable (RTP)", call_id=caller_channel_id, error=str(exc))
@@ -8441,6 +8492,16 @@ class Engine:
                         )
                     except Exception:
                         logger.debug("Provider input capture failed (continuous-input RTP)", call_id=session.call_id, exc_info=True)
+                    try:
+                        await self._publish_audio_to_voiceai(
+                            caller_channel_id,
+                            prov_payload,
+                            role="user",
+                            encoding=prov_enc,
+                            sample_rate=prov_rate,
+                        )
+                    except Exception:
+                        logger.debug("VoiceAI user audio publish failed (RTP/provider)", call_id=caller_channel_id, exc_info=True)
                     # CRITICAL: Pass sample_rate and encoding to provider
                     # Google Live needs these to avoid double resampling
                     await provider.send_audio(prov_payload, sample_rate=prov_rate, encoding=prov_enc)
@@ -8595,6 +8656,16 @@ class Engine:
                 return
 
             # Forward PCM16 16k frames to provider
+            try:
+                await self._publish_audio_to_voiceai(
+                    caller_channel_id,
+                    pcm_16k,
+                    role="user",
+                    encoding="slin",
+                    sample_rate=16000,
+                )
+            except Exception:
+                logger.debug("VoiceAI user audio publish failed (RTP/provider-legacy)", call_id=caller_channel_id, exc_info=True)
             await provider.send_audio(pcm_16k)
             # Provider-owned mode: local VAD fallback may flush local output (never cancels provider).
             try:
@@ -9197,6 +9268,7 @@ class Engine:
                 chunk: bytes = event.get("data") or b""
                 if not chunk:
                     return
+                provider_segment_id = event.get("segment_id") or event.get("turn_id")
                 # If barge-in fired, suppress provider audio locally for a short window so streaming
                 # doesn't immediately restart with the remainder of the previous sentence.
                 try:
@@ -9520,7 +9592,17 @@ class Engine:
                         )
                         logger.info("COALESCE START", call_id=call_id, coalesced_ms=buf_ms, coalesced_bytes=len(buf))
                         try:
-                            q.put_nowait(bytes(buf))
+                            coalesced_audio = bytes(buf)
+                            monitor_segment_id = self._get_voiceai_segment_id(call_id, "assistant", provider_segment_id)
+                            self._schedule_voiceai_audio_publish(
+                                call_id,
+                                coalesced_audio,
+                                role="assistant",
+                                encoding=(self._canonicalize_encoding(fmt_info.get("encoding") or encoding or target_encoding or "ulaw") or "ulaw"),
+                                sample_rate=int(target_sample_rate or source_sample_rate or wire_rate or 8000),
+                                segment_id=monitor_segment_id,
+                            )
+                            q.put_nowait(coalesced_audio)
                             # Account for the initial coalesced enqueue
                             try:
                                 self._enqueued_bytes[call_id] = int(self._enqueued_bytes.get(call_id, 0)) + len(buf)
@@ -9630,16 +9712,40 @@ class Engine:
                         except Exception:
                             pass
                         self._provider_bytes[call_id] = int(self._provider_bytes.get(call_id, 0)) + (len(chunk) if isinstance(chunk, (bytes, bytearray)) else sum(len(f) for f in (out_chunk if isinstance(out_chunk, list) else [out_chunk])))
+                        monitor_encoding = self._canonicalize_encoding(transport_encoding or enc or encoding or "ulaw") or "ulaw"
+                        monitor_sample_rate = int(wire_rate or rate or sample_rate_int or 8000)
                         if isinstance(out_chunk, list):
                             for frame in out_chunk:
+                                monitor_segment_id = self._get_voiceai_segment_id(call_id, "assistant", provider_segment_id)
+                                self._schedule_voiceai_audio_publish(
+                                    call_id,
+                                    frame,
+                                    role="assistant",
+                                    encoding=monitor_encoding,
+                                    sample_rate=monitor_sample_rate,
+                                    segment_id=monitor_segment_id,
+                                )
                                 q.put_nowait(frame)
                                 self._enqueued_bytes[call_id] = int(self._enqueued_bytes.get(call_id, 0)) + len(frame)
                         else:
+                            monitor_segment_id = self._get_voiceai_segment_id(call_id, "assistant", provider_segment_id)
+                            self._schedule_voiceai_audio_publish(
+                                call_id,
+                                out_chunk,
+                                role="assistant",
+                                encoding=monitor_encoding,
+                                sample_rate=monitor_sample_rate,
+                                segment_id=monitor_segment_id,
+                            )
                             q.put_nowait(out_chunk)
                             self._enqueued_bytes[call_id] = int(self._enqueued_bytes.get(call_id, 0)) + len(out_chunk)
                     except asyncio.QueueFull:
                         logger.debug("Provider streaming queue full; dropping chunk", call_id=call_id)
             elif etype == "AgentAudioDone":
+                provider_segment_id = event.get("segment_id") or event.get("turn_id")
+                monitor_segment_id = self._get_voiceai_segment_id(call_id, "assistant", provider_segment_id)
+                self._schedule_voiceai_audio_publish(call_id, b"", force=True, segment_id=monitor_segment_id)
+                self._finish_voiceai_segment(call_id, "assistant")
                 # If we were suppressing output due to barge-in, end suppression at a segment boundary.
                 # This prevents cutting into the next (new) response once the provider finishes the interrupted one.
                 try:
@@ -10160,6 +10266,7 @@ class Engine:
                         session.conversation_history = []
                     session.conversation_history.append(_ts_msg("user", text))
                     await self.session_store.upsert_call(session)
+                    await self._publish_transcript_to_voiceai(call_id, "user", text, "provider_user")
                     logger.debug("Added user transcript to history", call_id=call_id, text_preview=text[:50])
             
             elif etype == "agent_transcript":
@@ -10171,6 +10278,17 @@ class Engine:
                         session.conversation_history = []
                     session.conversation_history.append(_ts_msg("assistant", text))
                     await self.session_store.upsert_call(session)
+                    await self._publish_transcript_to_voiceai(
+                        call_id,
+                        "assistant",
+                        text,
+                        "provider_agent",
+                        segment_id=self._get_voiceai_transcript_segment_id(
+                            call_id,
+                            "assistant",
+                            event.get("segment_id") or event.get("turn_id"),
+                        ),
+                    )
                     logger.debug("Added agent transcript to history", call_id=call_id, text_preview=text[:50])
             
             else:
@@ -10179,6 +10297,213 @@ class Engine:
 
         except Exception as exc:
             logger.error("Error handling provider event", error=str(exc), exc_info=True)
+
+    def _get_voiceai_segment_id(self, call_id: str, role: str, preferred_segment_id: Optional[str] = None) -> str:
+        if role != "assistant":
+            return f"{call_id}:{role}:{int(time.time() * 1000)}"
+        if preferred_segment_id:
+            segment_id = str(preferred_segment_id)
+            self._voiceai_assistant_segment_ids[call_id] = segment_id
+            self._voiceai_last_assistant_segment_ids[call_id] = segment_id
+            return segment_id
+        segment_id = self._voiceai_assistant_segment_ids.get(call_id)
+        if not segment_id:
+            segment_id = f"{call_id}:assistant:{uuid.uuid4().hex[:12]}"
+            self._voiceai_assistant_segment_ids[call_id] = segment_id
+        self._voiceai_last_assistant_segment_ids[call_id] = segment_id
+        return segment_id
+
+    def _finish_voiceai_segment(self, call_id: str, role: str) -> None:
+        if role == "assistant":
+            self._voiceai_assistant_segment_ids.pop(call_id, None)
+            self._voiceai_last_assistant_segment_done_ts[call_id] = time.time()
+
+    def _get_voiceai_transcript_segment_id(
+        self,
+        call_id: str,
+        role: str,
+        preferred_segment_id: Optional[str] = None,
+    ) -> Optional[str]:
+        if role != "assistant":
+            return None
+        if preferred_segment_id:
+            segment_id = str(preferred_segment_id)
+            self._voiceai_last_assistant_segment_ids[call_id] = segment_id
+            return segment_id
+        segment_id = self._voiceai_assistant_segment_ids.get(call_id)
+        if segment_id:
+            return segment_id
+        last_segment_id = self._voiceai_last_assistant_segment_ids.get(call_id)
+        last_done_ts = float(self._voiceai_last_assistant_segment_done_ts.get(call_id, 0.0) or 0.0)
+        if last_segment_id and last_done_ts and (time.time() - last_done_ts) <= 5.0:
+            return last_segment_id
+        return self._get_voiceai_segment_id(call_id, role)
+
+    async def _publish_transcript_to_voiceai(
+        self,
+        call_id: str,
+        role: str,
+        text: str,
+        source: str,
+        *,
+        segment_id: Optional[str] = None,
+    ) -> None:
+        if not call_id or not text:
+            return
+        if not self._voiceai_backend_token:
+            logger.debug("Skipping transcript publish: backend token missing", call_id=call_id, source=source)
+            return
+        url = f"{self._voiceai_backend_base_url}/api/v1/calls/{call_id}/transcript/internal"
+        payload = {"role": role, "content": text, "source": source}
+        if segment_id:
+            payload["segment_id"] = segment_id
+        headers = {
+            "Content-Type": "application/json",
+            "X-AI-Engine-Token": self._voiceai_backend_token,
+        }
+        try:
+            async with ClientSession() as session:
+                async with session.post(url, json=payload, headers=headers, timeout=5) as response:
+                    if response.status >= 400:
+                        body = await response.text()
+                        logger.warning(
+                            "VoiceAI transcript publish failed",
+                            call_id=call_id,
+                            source=source,
+                            status=response.status,
+                            body=body[:200],
+                        )
+        except Exception:
+            logger.warning("VoiceAI transcript publish exception", call_id=call_id, source=source, exc_info=True)
+
+    async def _publish_audio_to_voiceai(
+        self,
+        call_id: str,
+        audio_bytes: bytes,
+        *,
+        role: str = "assistant",
+        encoding: Optional[str] = None,
+        sample_rate: Optional[int] = None,
+        force: bool = False,
+        segment_id: Optional[str] = None,
+    ) -> None:
+        if not call_id or not self._voiceai_audio_monitor_enabled:
+            return
+        if not self._voiceai_backend_token:
+            logger.debug("Skipping audio publish: backend token missing", call_id=call_id)
+            return
+
+        buffer_key = f"{call_id}:{role or 'assistant'}"
+        buf = self._voiceai_audio_monitor_buffers.setdefault(buffer_key, bytearray())
+        if segment_id:
+            current_segment_id = self._voiceai_audio_monitor_buffer_segments.get(buffer_key)
+            if current_segment_id and current_segment_id != segment_id and buf:
+                await self._flush_voiceai_audio_buffer(
+                    call_id,
+                    role=role,
+                    buffer_key=buffer_key,
+                    payload_audio=bytes(buf),
+                    encoding=encoding,
+                    sample_rate=sample_rate,
+                    segment_id=current_segment_id,
+                )
+                buf.clear()
+            self._voiceai_audio_monitor_buffer_segments[buffer_key] = segment_id
+        if audio_bytes:
+            buf.extend(audio_bytes)
+        if not force and len(buf) < max(1, self._voiceai_audio_monitor_min_bytes):
+            return
+        if not buf:
+            return
+
+        payload_audio = bytes(buf)
+        buf.clear()
+        await self._flush_voiceai_audio_buffer(
+            call_id,
+            role=role,
+            buffer_key=buffer_key,
+            payload_audio=payload_audio,
+            encoding=encoding,
+            sample_rate=sample_rate,
+            segment_id=self._voiceai_audio_monitor_buffer_segments.get(buffer_key),
+        )
+        self._voiceai_audio_monitor_buffer_segments.pop(buffer_key, None)
+
+    async def _flush_voiceai_audio_buffer(
+        self,
+        call_id: str,
+        *,
+        role: str,
+        buffer_key: str,
+        payload_audio: bytes,
+        encoding: Optional[str] = None,
+        sample_rate: Optional[int] = None,
+        segment_id: Optional[str] = None,
+    ) -> None:
+        url = f"{self._voiceai_backend_base_url}/api/v1/calls/{call_id}/audio/internal"
+        payload = {
+            "role": role,
+            "audio_base64": base64.b64encode(payload_audio).decode("ascii"),
+            "encoding": encoding or "ulaw",
+            "sample_rate": sample_rate or 8000,
+        }
+        if segment_id:
+            payload["segment_id"] = segment_id
+        headers = {
+            "Content-Type": "application/json",
+            "X-AI-Engine-Token": self._voiceai_backend_token,
+        }
+        try:
+            async with ClientSession() as session:
+                async with session.post(url, json=payload, headers=headers, timeout=5) as response:
+                    if response.status >= 400:
+                        body = await response.text()
+                        logger.warning(
+                            "VoiceAI audio publish failed",
+                            call_id=call_id,
+                            status=response.status,
+                            body=body[:200],
+                        )
+                    else:
+                        logger.info(
+                            "VoiceAI audio publish ok",
+                            call_id=call_id,
+                            bytes=len(payload_audio),
+                            encoding=payload["encoding"],
+                            sample_rate=payload["sample_rate"],
+                        )
+        except Exception:
+            logger.warning("VoiceAI audio publish exception", call_id=call_id, exc_info=True)
+
+    def _schedule_voiceai_audio_publish(
+        self,
+        call_id: str,
+        audio_bytes: bytes,
+        *,
+        role: str = "assistant",
+        encoding: Optional[str] = None,
+        sample_rate: Optional[int] = None,
+        force: bool = False,
+        segment_id: Optional[str] = None,
+    ) -> None:
+        """Publish monitor audio without blocking the realtime playback queue."""
+        try:
+            if not call_id or not self._voiceai_audio_monitor_enabled:
+                return
+            task = asyncio.create_task(
+                self._publish_audio_to_voiceai(
+                    call_id,
+                    audio_bytes,
+                    role=role,
+                    encoding=encoding,
+                    sample_rate=sample_rate,
+                    force=force,
+                    segment_id=segment_id,
+                )
+            )
+            task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+        except Exception:
+            logger.debug("Failed to schedule VoiceAI audio publish", call_id=call_id, exc_info=True)
 
     def _as_to_pcm16_16k(self, audio_bytes: bytes) -> bytes:
         """Convert AudioSocket inbound bytes to PCM16 @ 16 kHz for pipeline STT.
@@ -10252,6 +10577,28 @@ class Engine:
             if not pipeline:
                 logger.debug("Pipeline runner: no pipeline resolved", call_id=call_id)
                 return
+            try:
+                default_voice = None
+                overrides = dict(getattr(session, "provider_overrides", {}) or {})
+                candidate = overrides.get("default_voice")
+                if not candidate and getattr(session, "context_name", None):
+                    ctx_cfg = self.transport_orchestrator.get_context_config(session.context_name)
+                    candidate = getattr(ctx_cfg, "default_voice", None) if ctx_cfg else None
+                if isinstance(candidate, dict) and candidate.get("voice_id"):
+                    default_voice = {
+                        k: v for k, v in candidate.items()
+                        if k in ("voice_id", "voice_revision_id", "hifi_id") and v
+                    }
+                if default_voice:
+                    pipeline.tts_options = dict(pipeline.tts_options or {})
+                    pipeline.tts_options["default_voice"] = default_voice
+                    logger.info(
+                        "Pipeline TTS default HiFi voice applied",
+                        call_id=call_id,
+                        voice_id=default_voice.get("voice_id"),
+                    )
+            except Exception:
+                logger.debug("Failed to apply default HiFi voice to pipeline TTS options", call_id=call_id, exc_info=True)
             # Inject context prompt into LLM options with fallback chain
             # Fallback chain: AI_CONTEXT → pipeline default → global llm_config
             llm_options = pipeline.llm_options or {}
@@ -12161,6 +12508,18 @@ class Engine:
                                 context=transport.context,
                                 prompt_length=len(prompt_to_apply or ""),
                             )
+                        default_voice = getattr(context_config, "default_voice", None)
+                        if isinstance(default_voice, dict) and default_voice.get("voice_id"):
+                            session.provider_overrides["default_voice"] = {
+                                k: v for k, v in default_voice.items()
+                                if k in ("voice_id", "voice_revision_id", "hifi_id") and v
+                            }
+                            logger.info(
+                                "Stored context default HiFi voice for provider session",
+                                call_id=session.call_id,
+                                context=transport.context,
+                                voice_id=session.provider_overrides["default_voice"].get("voice_id"),
+                            )
                         await self._save_session(session)
                     except Exception as exc:
                         logger.error(
@@ -13112,6 +13471,7 @@ class Engine:
         prompt = overrides.get("prompt")
         target_encoding = overrides.get("target_encoding")
         target_rate = overrides.get("target_sample_rate_hz")
+        default_voice = overrides.get("default_voice")
 
         try:
             if isinstance(cfg, dict):
@@ -13125,6 +13485,11 @@ class Engine:
                     cfg["target_encoding"] = target_encoding
                 if target_rate:
                     cfg["target_sample_rate_hz"] = target_rate
+                if isinstance(default_voice, dict):
+                    cfg["default_voice"] = {
+                        k: v for k, v in default_voice.items()
+                        if k in ("voice_id", "voice_revision_id", "hifi_id") and v
+                    }
             else:
                 if greeting and hasattr(cfg, "greeting"):
                     setattr(cfg, "greeting", greeting)
@@ -13137,6 +13502,15 @@ class Engine:
                     setattr(cfg, "target_encoding", target_encoding)
                 if target_rate and hasattr(cfg, "target_sample_rate_hz"):
                     setattr(cfg, "target_sample_rate_hz", target_rate)
+                if isinstance(default_voice, dict) and hasattr(cfg, "default_voice"):
+                    setattr(
+                        cfg,
+                        "default_voice",
+                        {
+                            k: v for k, v in default_voice.items()
+                            if k in ("voice_id", "voice_revision_id", "hifi_id") and v
+                        },
+                    )
         except Exception:
             logger.debug("Failed applying provider overrides", call_id=session.call_id, exc_info=True)
 
@@ -13144,8 +13518,10 @@ class Engine:
         try:
             if greeting and hasattr(provider, "set_initial_greeting"):
                 provider.set_initial_greeting(greeting)
+            if isinstance(default_voice, dict) and hasattr(provider, "set_default_voice"):
+                provider.set_default_voice(default_voice)
         except Exception:
-            logger.debug("Provider set_initial_greeting failed", call_id=session.call_id, exc_info=True)
+            logger.debug("Provider runtime override helper failed", call_id=session.call_id, exc_info=True)
 
     async def _start_provider_session(self, call_id: str) -> None:
         """Start the provider session for a call when media path is ready."""
@@ -13187,6 +13563,12 @@ class Engine:
                                             prompt_to_apply, getattr(session, "outbound_custom_vars", {}) or {}
                                         )
                                     session.provider_overrides["prompt"] = prompt_to_apply
+                                default_voice = getattr(ctx_cfg, "default_voice", None)
+                                if isinstance(default_voice, dict) and default_voice.get("voice_id"):
+                                    session.provider_overrides["default_voice"] = {
+                                        k: v for k, v in default_voice.items()
+                                        if k in ("voice_id", "voice_revision_id", "hifi_id") and v
+                                    }
                                 await self._save_session(session)
                     except Exception:
                         logger.debug(

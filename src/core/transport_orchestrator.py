@@ -46,6 +46,7 @@ class ContextConfig:
     provider: Optional[str] = None
     pipeline: Optional[str] = None  # Pipeline name for modular STT/LLM/TTS (e.g., local_hybrid)
     tools: Optional[list] = None  # In-call tool names for function calling
+    default_voice: Optional[Dict[str, Any]] = None  # HiFi voice_library selection for TTS
     background_music: Optional[str] = None  # MOH class name for background music during calls
     
     # Phase tool configuration (Milestone 24)
@@ -151,6 +152,7 @@ class TransportOrchestrator:
                     provider=context_dict.get('provider'),
                     pipeline=context_dict.get('pipeline'),  # Modular pipeline name (e.g., local_hybrid)
                     tools=context_dict.get('tools'),  # In-call tools for function calling
+                    default_voice=context_dict.get('default_voice') if isinstance(context_dict.get('default_voice'), dict) else None,
                     background_music=context_dict.get('background_music'),  # MOH class for background music
                     # Phase tool configuration (Milestone 24)
                     pre_call_tools=context_dict.get('pre_call_tools'),

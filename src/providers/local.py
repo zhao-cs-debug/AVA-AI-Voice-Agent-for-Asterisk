@@ -44,6 +44,7 @@ class LocalProvider(AIProviderInterface, ProviderCapabilitiesMixin):
         self._agent_audio_done_tasks: Dict[str, asyncio.Task] = {}
         # Initial greeting text provided by engine/config (optional)
         self._initial_greeting: Optional[str] = None
+        self._default_voice: Optional[Dict[str, Any]] = self._normalize_voice(getattr(config, "default_voice", None))
         # Mode for local_ai_server: "full" or "stt" (for hybrid pipelines with cloud LLM)
         self._mode: str = getattr(config, 'mode', 'full') or 'full'
         # Track if server port is unavailable (not running at all)
@@ -124,6 +125,25 @@ class LocalProvider(AIProviderInterface, ProviderCapabilitiesMixin):
         except Exception:
             value = ""
         self._initial_greeting = value or None
+
+    def set_default_voice(self, voice: Optional[Dict[str, Any]]) -> None:
+        self._default_voice = self._normalize_voice(voice)
+
+    def _normalize_voice(self, voice: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:
+        if not isinstance(voice, dict):
+            return None
+        normalized: Dict[str, str] = {}
+        for key in ("voice_id", "voice_revision_id", "hifi_id"):
+            value = str(voice.get(key) or "").strip()
+            if value:
+                normalized[key] = value
+        return normalized if normalized.get("voice_id") else None
+
+    def _attach_default_voice(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        voice = self._normalize_voice(self._default_voice)
+        if voice:
+            payload["voice"] = voice
+        return payload
 
     async def notify_barge_in(self, call_id: Optional[str]) -> None:
         """Notify local_ai_server that engine barge-in occurred for this call.
@@ -1627,8 +1647,10 @@ class LocalProvider(AIProviderInterface, ProviderCapabilitiesMixin):
             tts_message = {
                 "type": "tts_request",
                 "call_id": call_id,
+                "mode": "tts",
                 "text": greeting_text,
             }
+            self._attach_default_voice(tts_message)
 
             await self.websocket.send(json.dumps(tts_message))
             logger.info("Sent greeting TTS request to Local AI Server", call_id=call_id)
@@ -1970,9 +1992,11 @@ class LocalProvider(AIProviderInterface, ProviderCapabilitiesMixin):
             # Send TTS request to Local AI Server
             tts_message = {
                 "type": "tts_request",
+                "mode": "tts",
                 "text": text,
                 "call_id": self._active_call_id or "greeting"
             }
+            self._attach_default_voice(tts_message)
             
             await self.websocket.send(json.dumps(tts_message))
             logger.info("Sent TTS request to Local AI Server", text=text[:50] + "..." if len(text) > 50 else text)

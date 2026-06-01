@@ -24,6 +24,7 @@ import {
     ArrowUpCircle,
     Phone,
     CalendarClock,
+    Music2,
     LogOut,
     Lock
 } from 'lucide-react';
@@ -91,6 +92,7 @@ const Sidebar = () => {
                     <SidebarItem to="/pipelines" icon={Workflow} label="Pipelines" />
                     <SidebarItem to="/contexts" icon={MessageSquare} label="Contexts" />
                     <SidebarItem to="/profiles" icon={Sliders} label="Audio Profiles" />
+                    <SidebarItem to="/voice-library" icon={Music2} label="Voice Library" />
                     <SidebarItem to="/tools" icon={Wrench} label="Tools" />
                     <SidebarItem to="/mcp" icon={Plug} label="MCP" />
                 </SidebarGroup>

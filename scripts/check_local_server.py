@@ -139,6 +139,14 @@ def _warn(msg: str) -> str:
 # WebSocket helpers
 # ---------------------------------------------------------------------------
 LLM_TELEPHONY_WARN_SEC = 15.0
+DEFAULT_TTS_PROBE_TEXT = "你好，这是本地语音合成测试。"
+DEFAULT_STT_PROBE_TEXT = "你好，这是本地语音识别测试。"
+
+
+def _get_probe_text(env_key: str, fallback: str) -> str:
+    """Return custom probe text from env if present, otherwise fallback."""
+    text = (os.getenv(env_key) or "").strip()
+    return text or fallback
 
 
 async def _connect(url: str, auth_token: Optional[str], timeout: float = 5.0):
@@ -351,11 +359,12 @@ async def check_tts(url: str, auth_token: Optional[str]) -> CheckResult:
         return CheckResult("tts_test", False, err)
 
     t0 = time.time()
+    probe_text = _get_probe_text("LOCAL_TTS_TEST_TEXT", DEFAULT_TTS_PROBE_TEXT)
     resp, err = await _send_recv_json(
         ws,
         {
             "type": "tts_request",
-            "text": "Hello, this is a test of the text to speech system.",
+            "text": probe_text,
             "response_format": "json",
         },
         timeout=15.0,
@@ -387,11 +396,12 @@ async def check_stt(url: str, auth_token: Optional[str]) -> CheckResult:
     if err:
         return CheckResult("stt_test", False, f"TTS connection: {err}")
 
+    probe_text = _get_probe_text("LOCAL_STT_TEST_TEXT", DEFAULT_STT_PROBE_TEXT)
     resp, err = await _send_recv_json(
         ws1,
         {
             "type": "tts_request",
-            "text": "Hello, this is a test of the speech recognition system.",
+            "text": probe_text,
             "response_format": "json",
         },
         timeout=15.0,
@@ -422,14 +432,32 @@ async def check_stt(url: str, auth_token: Optional[str]) -> CheckResult:
     await _send_recv_json(ws2, {"type": "set_mode", "mode": "stt"}, timeout=5.0)
 
     t0 = time.time()
-    audio_payload = {
-        "type": "audio",
-        "data": base64.b64encode(pcm16k).decode(),
-        "mode": "stt",
-        "rate": 16000,
-    }
     try:
-        await ws2.send(json.dumps(audio_payload))
+        # Stream as small chunks with short delays so server-side endpointing
+        # (which relies on wall clock) can observe voice then trailing silence.
+        chunk_ms = 200
+        chunk_bytes = int(16000 * (chunk_ms / 1000.0) * 2)  # 16kHz PCM16 mono
+        for i in range(0, len(pcm16k), chunk_bytes):
+            payload = {
+                "type": "audio",
+                "data": base64.b64encode(pcm16k[i : i + chunk_bytes]).decode(),
+                "mode": "stt",
+                "rate": 16000,
+            }
+            await ws2.send(json.dumps(payload))
+            await asyncio.sleep(0.08)
+
+        # Send trailing silence frames (about 1.2s total) to force finalization.
+        silence_chunk = b"\x00\x00" * int(16000 * 0.2)  # 200ms
+        silence_payload = {
+            "type": "audio",
+            "data": base64.b64encode(silence_chunk).decode(),
+            "mode": "stt",
+            "rate": 16000,
+        }
+        for _ in range(6):
+            await ws2.send(json.dumps(silence_payload))
+            await asyncio.sleep(0.2)
     except Exception as exc:
         await ws2.close()
         return CheckResult("stt_test", False, f"Failed to send audio: {exc}")
@@ -438,7 +466,7 @@ async def check_stt(url: str, auth_token: Optional[str]) -> CheckResult:
     transcript = ""
     try:
         while True:
-            raw = await asyncio.wait_for(ws2.recv(), timeout=10.0)
+            raw = await asyncio.wait_for(ws2.recv(), timeout=20.0)
             if isinstance(raw, str):
                 msg = json.loads(raw)
                 if msg.get("type") == "stt_result" and msg.get("is_final") and msg.get("text", "").strip():

@@ -109,6 +109,8 @@ class LocalProviderConfig(BaseModel):
     tool_call_policy: str = Field(default="auto")
     # Structured tool gateway for full-local provider. Keeps modular local STT/TTS paths unchanged.
     tool_gateway_enabled: bool = Field(default=True)
+    # Optional HiFi voice selection forwarded to local_ai_server tts_request.voice.
+    default_voice: Optional[Dict[str, Any]] = None
     chunk_ms: int = Field(default=200)
     max_tokens: int = Field(default=150)
     temperature: float = Field(default=0.4)
