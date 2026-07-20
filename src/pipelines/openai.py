@@ -95,6 +95,23 @@ def _make_http_headers(options: Dict[str, Any]) -> Dict[str, str]:
     return headers
 
 
+def _is_tool_choice_unsupported_error(status: int, body: str) -> bool:
+    if status not in (400, 422):
+        return False
+    body_lower = (body or "").lower()
+    tool_markers = (
+        "tool choice",
+        "tool_choice",
+        "tool call",
+        "tool calling",
+        "enable-auto-tool-choice",
+        "tool-call-parser",
+        "failed to call a function",
+        "failed_generation",
+    )
+    return any(marker in body_lower for marker in tool_markers)
+
+
 def _decode_audio_payload(raw_bytes: bytes) -> bytes:
     try:
         payload = json.loads(raw_bytes.decode("utf-8"))
@@ -109,6 +126,84 @@ def _decode_audio_payload(raw_bytes: bytes) -> bytes:
     except (base64.binascii.Error, TypeError):
         logger.warning("Failed to base64 decode OpenAI audio payload")
         return raw_bytes
+
+
+def _append_local_tool_prompt(payload: Dict[str, Any], tool_names: Iterable[str]) -> bool:
+    allowed = [str(name or "").strip() for name in (tool_names or []) if str(name or "").strip()]
+    if not allowed:
+        return False
+    try:
+        tool_prompt = tool_registry.to_local_llm_prompt_filtered_compact(allowed)
+    except Exception:
+        logger.debug("Failed to build local tool fallback prompt", exc_info=True)
+        return False
+    if not tool_prompt:
+        return False
+    if "live_agent_transfer" in allowed:
+        tool_prompt = (
+            f"{tool_prompt}\n"
+            "Critical transfer rule: if the caller asks for human support, a live agent, "
+            "a person in charge, customer service, or asks to transfer/connect them to a person, "
+            "output exactly <tool_call>{\"name\":\"live_agent_transfer\",\"arguments\":{\"target\":\"702\"}}</tool_call> "
+            "and a short spoken sentence such as I will transfer you now."
+        )
+
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return False
+
+    marker = "Return tool calls ONLY in this exact format"
+    for msg in messages:
+        if isinstance(msg, dict) and marker in str(msg.get("content") or ""):
+            return True
+
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("role") == "system":
+            base = str(msg.get("content") or "").strip()
+            msg["content"] = f"{base}\n\n{tool_prompt}".strip() if base else tool_prompt
+            return True
+
+    messages.insert(0, {"role": "system", "content": tool_prompt})
+    return True
+
+
+def _parse_local_tool_fallback_response(content: str, allowed_tools: Iterable[str]) -> tuple[str, list[Dict[str, Any]]]:
+    try:
+        from src.tools.parser import parse_response_with_tools
+
+        clean_text, parsed_tool_calls = parse_response_with_tools(content or "")
+    except Exception:
+        logger.debug("Failed parsing local tool fallback response", exc_info=True)
+        return content or "", []
+
+    allowed = [str(name or "").strip() for name in (allowed_tools or []) if str(name or "").strip()]
+    sanitized: list[Dict[str, Any]] = []
+    for tc in parsed_tool_calls or []:
+        name = str(tc.get("name") or "").strip()
+        if not tool_registry.is_tool_allowed(name, allowed):
+            logger.info("Dropping disallowed local fallback tool call", tool=name)
+            continue
+        params = tc.get("parameters") or tc.get("arguments") or {}
+        if not isinstance(params, dict):
+            params = {}
+        sanitized.append({
+            "id": f"local_fallback_{len(sanitized)}",
+            "name": tool_registry.canonicalize_tool_name(name) or name,
+            "parameters": params,
+            "type": "function",
+        })
+    return clean_text or "", sanitized
+
+
+def _use_native_tool_calling(options: Dict[str, Any]) -> bool:
+    """Return True only when explicitly opting into provider-native tool calling."""
+
+    value = (options or {}).get("native_tool_calling")
+    if value is None:
+        value = (options or {}).get("use_native_tool_calling")
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on", "native"}
+    return bool(value)
 
 
 # OpenAI Speech-to-Text Adapter --------------------------------------------------
@@ -430,6 +525,11 @@ class OpenAILLMAdapter(LLMComponent):
                 merged["chat_base_url"] = options["base_url"]
         # Avoid validator selecting the wrong URL (it prioritizes `base_url`).
         merged.pop("base_url", None)
+        # OpenAI-compatible servers such as vLLM expose model discovery at /models,
+        # while the API namespace root (/v1) may correctly return 404.
+        chat_base = str(merged.get("chat_base_url") or "").rstrip("/")
+        if chat_base:
+            merged["chat_base_url"] = f"{chat_base}/models"
         # If options contain an incompatible model, don't let it override validation.
         if "model" in options and "chat_model" not in options:
             if not str(options.get("model") or "").startswith(("gpt-", "o", "chatgpt")):
@@ -474,9 +574,13 @@ class OpenAILLMAdapter(LLMComponent):
                 else:
                     logger.warning("Tool not found in registry", tool=tool_name)
             
-        if tool_schemas:
+        use_native_tools = bool(tool_schemas) and _use_native_tool_calling(merged)
+        local_tool_prompt_active = False
+        if tool_schemas and use_native_tools:
             payload["tools"] = tool_schemas
             payload["tool_choice"] = "auto"
+        elif tools_list:
+            local_tool_prompt_active = _append_local_tool_prompt(payload, tools_list or [])
 
         headers = _make_http_headers(merged)
         url = merged["chat_base_url"].rstrip("/") + "/chat/completions"
@@ -507,23 +611,24 @@ class OpenAILLMAdapter(LLMComponent):
                             status=response.status,
                             body_preview=body[:128],
                         )
-                        # Some OpenAI-compatible endpoints (notably Groq) are not reliable with tool calling.
+                        # Some OpenAI-compatible endpoints (notably vLLM/Groq) are not reliable with tool calling.
                         # If the request included tools and the provider reports a tool-calling failure, retry once without tools.
                         if (
                             not tools_stripped
                             and payload.get("tools")
-                            and response.status in (400, 422)
-                            and ("Failed to call a function" in body or "failed_generation" in body)
+                            and _is_tool_choice_unsupported_error(response.status, body)
                             and attempt < retries
                         ):
                             tools_stripped = True
                             payload = dict(payload)
                             payload.pop("tools", None)
                             payload.pop("tool_choice", None)
+                            local_prompt_added = _append_local_tool_prompt(payload, tools_list or [])
                             logger.warning(
-                                "Tool calling failed; retrying chat completion without tools",
+                                "Tool calling unsupported; retrying chat completion with local tool prompt fallback",
                                 call_id=call_id,
                                 status=response.status,
+                                local_prompt_added=local_prompt_added,
                             )
                             continue
 
@@ -570,8 +675,21 @@ class OpenAILLMAdapter(LLMComponent):
                             metadata=data.get("usage", {})
                         )
                     
+                    parsed_text = content or ""
+                    parsed_tool_calls = []
+                    if (tools_stripped or local_tool_prompt_active) and tools_list:
+                        parsed_text, parsed_tool_calls = _parse_local_tool_fallback_response(content or "", tools_list)
+                        if parsed_tool_calls:
+                            logger.info(
+                                "OpenAI chat completion parsed local fallback tool calls",
+                                call_id=call_id,
+                                tool_calls=len(parsed_tool_calls),
+                                tools=[tc.get("name") for tc in parsed_tool_calls],
+                            )
+                            return LLMResponse(text=parsed_text, tool_calls=parsed_tool_calls, metadata=data.get("usage", {}))
+
                     logger.info("OpenAI chat completion received", **log_ctx)
-                    return LLMResponse(text=content or "", tool_calls=[], metadata=data.get("usage", {}))
+                    return LLMResponse(text=parsed_text, tool_calls=[], metadata=data.get("usage", {}))
             except aiohttp.ClientError as e:
                 if self._session is None or self._session.closed:
                     logger.info("OpenAI LLM generation cancelled (session closed)", call_id=call_id)
@@ -685,59 +803,102 @@ class OpenAILLMAdapter(LLMComponent):
                 tool = tool_registry.get(tool_name)
                 if tool:
                     tool_schemas.append(tool.definition.to_openai_schema())
-        if tool_schemas:
+        use_native_tools = bool(tool_schemas) and _use_native_tool_calling(merged)
+        local_tool_prompt_active = False
+        if tool_schemas and use_native_tools:
             payload["tools"] = tool_schemas
             payload["tool_choice"] = "auto"
+        elif tools_list:
+            local_tool_prompt_active = _append_local_tool_prompt(payload, tools_list or [])
 
         headers = _make_http_headers(merged)
         url = merged["chat_base_url"].rstrip("/") + "/chat/completions"
 
         # Accumulate tool call deltas across chunks
         _tool_call_accum: dict = {}  # index -> {id, name, arguments}
+        buffer: list[str] = []
 
+        tools_stripped = False
         try:
-            async with self._session.post(url, json=payload, headers=headers, timeout=merged["timeout_sec"]) as response:
-                if response.status >= 400:
-                    body = await response.text()
-                    logger.error("OpenAI streaming failed", call_id=call_id, status=response.status, body_preview=body[:128])
-                    return
+            for attempt in range(2):
+                async with self._session.post(url, json=payload, headers=headers, timeout=merged["timeout_sec"]) as response:
+                    if response.status >= 400:
+                        body = await response.text()
+                        logger.error("OpenAI streaming failed", call_id=call_id, status=response.status, body_preview=body[:128])
+                        if (
+                            not tools_stripped
+                            and payload.get("tools")
+                            and _is_tool_choice_unsupported_error(response.status, body)
+                            and attempt == 0
+                        ):
+                            tools_stripped = True
+                            payload = dict(payload)
+                            payload.pop("tools", None)
+                            payload.pop("tool_choice", None)
+                            local_prompt_added = _append_local_tool_prompt(payload, tools_list or [])
+                            logger.warning(
+                                "Tool calling unsupported; retrying streaming chat completion with local tool prompt fallback",
+                                call_id=call_id,
+                                status=response.status,
+                                local_prompt_added=local_prompt_added,
+                            )
+                            continue
+                        return
 
-                async for line in response.content:
-                    line_str = line.decode("utf-8", errors="replace").strip()
-                    if not line_str or not line_str.startswith("data: "):
-                        continue
-                    data_str = line_str[6:]
-                    if data_str == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data_str)
-                        choices = chunk.get("choices", [])
-                        if choices:
-                            delta = choices[0].get("delta", {})
-                            content = delta.get("content")
-                            if content:
-                                yield content
+                    async for line in response.content:
+                        line_str = line.decode("utf-8", errors="replace").strip()
+                        if not line_str or not line_str.startswith("data: "):
+                            continue
+                        data_str = line_str[6:]
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data_str)
+                            choices = chunk.get("choices", [])
+                            if choices:
+                                delta = choices[0].get("delta", {})
+                                content = delta.get("content")
+                                if content:
+                                    if (tools_stripped or local_tool_prompt_active) and tools_list:
+                                        buffer.append(content)
+                                    else:
+                                        yield content
 
-                            # Accumulate tool call deltas
-                            for tc_delta in delta.get("tool_calls", []):
-                                idx = tc_delta.get("index", 0)
-                                if idx not in _tool_call_accum:
-                                    _tool_call_accum[idx] = {
-                                        "id": tc_delta.get("id", ""),
-                                        "name": "",
-                                        "arguments": "",
-                                        "type": tc_delta.get("type", "function"),
-                                    }
-                                entry = _tool_call_accum[idx]
-                                if tc_delta.get("id"):
-                                    entry["id"] = tc_delta["id"]
-                                func = tc_delta.get("function", {})
-                                if func.get("name"):
-                                    entry["name"] = func["name"]
-                                if func.get("arguments"):
-                                    entry["arguments"] += func["arguments"]
-                    except json.JSONDecodeError:
-                        continue
+                                # Accumulate tool call deltas
+                                for tc_delta in delta.get("tool_calls", []):
+                                    idx = tc_delta.get("index", 0)
+                                    if idx not in _tool_call_accum:
+                                        _tool_call_accum[idx] = {
+                                            "id": tc_delta.get("id", ""),
+                                            "name": "",
+                                            "arguments": "",
+                                            "type": tc_delta.get("type", "function"),
+                                        }
+                                    entry = _tool_call_accum[idx]
+                                    if tc_delta.get("id"):
+                                        entry["id"] = tc_delta["id"]
+                                    func = tc_delta.get("function", {})
+                                    if func.get("name"):
+                                        entry["name"] = func["name"]
+                                    if func.get("arguments"):
+                                        entry["arguments"] += func["arguments"]
+                        except json.JSONDecodeError:
+                            continue
+                    break
+
+            if (tools_stripped or local_tool_prompt_active) and buffer:
+                buffered_text = "".join(buffer)
+                clean_text, parsed_tool_calls = _parse_local_tool_fallback_response(buffered_text, tools_list or [])
+                if parsed_tool_calls:
+                    self._pending_tool_calls_by_call[call_id].extend(parsed_tool_calls)
+                    logger.info(
+                        "OpenAI streaming parsed local fallback tool calls",
+                        call_id=call_id,
+                        tool_count=len(parsed_tool_calls),
+                        tools=[tc.get("name") for tc in parsed_tool_calls],
+                    )
+                if clean_text:
+                    yield clean_text
 
             # Parse accumulated tool calls
             if _tool_call_accum:
@@ -819,6 +980,17 @@ class OpenAILLMAdapter(LLMComponent):
             "timeout_sec": float(runtime_options.get("timeout_sec", self._pipeline_defaults.get("timeout_sec", self._default_timeout))),
             "use_realtime": runtime_options.get("use_realtime", self._pipeline_defaults.get("use_realtime", False)),
             "tools": runtime_options.get("tools", self._pipeline_defaults.get("tools", [])),
+            "extra_body": runtime_options.get("extra_body", self._pipeline_defaults.get("extra_body", {})),
+            "native_tool_calling": runtime_options.get(
+                "native_tool_calling",
+                runtime_options.get(
+                    "use_native_tool_calling",
+                    self._pipeline_defaults.get(
+                        "native_tool_calling",
+                        self._pipeline_defaults.get("use_native_tool_calling", False),
+                    ),
+                ),
+            ),
             "api_version": runtime_options.get(
                 "api_version",
                 self._pipeline_defaults.get("api_version", getattr(self._provider_defaults, "api_version", "ga")),
@@ -872,6 +1044,9 @@ class OpenAILLMAdapter(LLMComponent):
             payload["temperature"] = merged["temperature"]
         if merged.get("max_tokens") is not None:
             payload["max_tokens"] = merged["max_tokens"]
+        extra_body = merged.get("extra_body")
+        if isinstance(extra_body, dict):
+            payload.update(extra_body)
         return payload
 
     def _coalesce_messages(self, transcript: str, context: Dict[str, Any], merged: Dict[str, Any]) -> list[Dict[str, str]]:

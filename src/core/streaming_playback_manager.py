@@ -605,21 +605,6 @@ class StreamingPlaybackManager:
                            stream_id=stream_id)
                 return None
             
-            # Start streaming task
-            streaming_task = asyncio.create_task(
-                self._stream_audio_loop(call_id, stream_id, audio_chunks, jitter_buffer)
-            )
-            
-            # Start pacer (consumer) task to drain jitter buffer independently of producer
-            pacer_task = asyncio.create_task(
-                self._pacer_loop(call_id, stream_id, jitter_buffer)
-            )
-            # Start keepalive task
-            keepalive_task = asyncio.create_task(
-                self._keepalive_loop(call_id, stream_id)
-            )
-            self.keepalive_tasks[call_id] = keepalive_task
-            
             src_encoding = self._canonicalize_encoding(source_encoding) or "slin16"
             try:
                 src_rate = int(source_sample_rate) if source_sample_rate is not None else self.sample_rate
@@ -715,9 +700,10 @@ class StreamingPlaybackManager:
             self.active_streams[call_id] = {
                 'stream_id': stream_id,
                 'playback_type': playback_type,
-                'streaming_task': streaming_task,
-                'pacer_task': pacer_task,
-                'keepalive_task': keepalive_task,
+                'streaming_task': None,
+                'pacer_task': None,
+                'keepalive_task': None,
+                'stop_event': asyncio.Event(),
                 'start_time': time.time(),
                 'seg_start_ts': time.time(),
                 'chunks_sent': 0,
@@ -755,6 +741,24 @@ class StreamingPlaybackManager:
                 'last_emit_was_filler': False,
             }
             self._startup_ready[call_id] = bool(initial_startup_ready)
+
+            # Register the stream before starting background tasks. The pacer
+            # checks active_streams immediately; starting it first creates a
+            # race where it can exit before any TTS audio is enqueued.
+            streaming_task = asyncio.create_task(
+                self._stream_audio_loop(call_id, stream_id, audio_chunks, jitter_buffer)
+            )
+            pacer_task = asyncio.create_task(
+                self._pacer_loop(call_id, stream_id, jitter_buffer)
+            )
+            keepalive_task = asyncio.create_task(
+                self._keepalive_loop(call_id, stream_id)
+            )
+            self.active_streams[call_id]['streaming_task'] = streaming_task
+            self.active_streams[call_id]['pacer_task'] = pacer_task
+            self.active_streams[call_id]['keepalive_task'] = keepalive_task
+            self.keepalive_tasks[call_id] = keepalive_task
+
             try:
                 _STREAM_STARTED_TOTAL.labels(playback_type).inc()
             except Exception:
@@ -992,30 +996,37 @@ class StreamingPlaybackManager:
                 sentinel_sent = True
             pacer_task: Optional[asyncio.Task] = None
             stream_info = self.active_streams.get(call_id)
-            if stream_info is not None:
+            owns_stream = self._stream_owns_slot(call_id, stream_id)
+            interrupted = False
+            if owns_stream:
                 stream_info['producer_closed'] = True
                 pacer_task = stream_info.get('pacer_task')
+                end_reason = str(stream_info.get('end_reason') or '')
+                interrupted = any(
+                    marker in end_reason
+                    for marker in ("barge", "interrupt", "cancel")
+                )
             if pacer_task and not pacer_task.done():
-                try:
-                    frames_remaining = self._estimate_available_frames(call_id, jitter_buffer, include_remainder=True)
-                except Exception:
-                    frames_remaining = 0
-                chunk_sec = max(0.02, self.chunk_size_ms / 1000.0)
-                # NOTE: Do not cap drain time too aggressively.
-                # In downstream streaming mode, providers/pipelines may enqueue a large amount of audio quickly
-                # and then signal end-of-stream. The pacer must be allowed to drain frame remainders;
-                # otherwise playback truncates (observed ~2s cutoff when drain_timeout was capped at 2.0s).
-                #
-                # We still cap the wait to avoid hanging indefinitely on transport failures.
-                drain_timeout = max(0.5, (frames_remaining * chunk_sec) + 0.5)
-                drain_timeout = min(120.0, drain_timeout)
-                with suppress(asyncio.CancelledError, asyncio.TimeoutError):
-                    await asyncio.wait_for(pacer_task, timeout=drain_timeout)
+                if interrupted:
+                    pacer_task.cancel()
+                else:
+                    try:
+                        frames_remaining = self._estimate_available_frames(call_id, jitter_buffer, include_remainder=True)
+                    except Exception:
+                        frames_remaining = 0
+                    chunk_sec = max(0.02, self.chunk_size_ms / 1000.0)
+                    # Natural EOS drains all queued frames; interruption discards them above.
+                    drain_timeout = max(0.5, (frames_remaining * chunk_sec) + 0.5)
+                    drain_timeout = min(120.0, drain_timeout)
+                    with suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                        await asyncio.wait_for(pacer_task, timeout=drain_timeout)
             if pacer_task and not pacer_task.done():
                 pacer_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await pacer_task
-            keepalive_task = self.keepalive_tasks.pop(call_id, None)
+            keepalive_task = stream_info.get('keepalive_task') if owns_stream else None
+            if self.keepalive_tasks.get(call_id) is keepalive_task:
+                self.keepalive_tasks.pop(call_id, None)
             if keepalive_task:
                 keepalive_task.cancel()
                 with suppress(asyncio.CancelledError):
@@ -1692,6 +1703,12 @@ class StreamingPlaybackManager:
                 # Simple decode: mulaw → PCM16
                 try:
                     pcm16_bytes = mulaw_to_pcm16le(chunk)
+                    pcm16_bytes = self._trim_strategy_leading_silence(
+                        call_id,
+                        pcm16_bytes,
+                    )
+                    if not pcm16_bytes:
+                        return None
                     # Deterministic normalization on fast-path when enabled
                     try:
                         if self.normalizer_enabled and self.normalizer_target_rms > 0 and pcm16_bytes:
@@ -2372,6 +2389,63 @@ class StreamingPlaybackManager:
             
         except Exception as e:
             logger.error("SILENCE TRIM FAILED", error=str(e), exc_info=True)
+            return pcm_bytes
+
+    def _trim_strategy_leading_silence(
+        self,
+        call_id: str,
+        pcm_bytes: bytes,
+        *,
+        threshold_rms: int = 100,
+        preroll_ms: int = 60,
+    ) -> bytes:
+        """Remove long leading silence from strategy TTS while preserving pre-roll."""
+        if not pcm_bytes:
+            return pcm_bytes
+
+        stream_info = self.active_streams.get(call_id)
+        if not stream_info or stream_info.get("playback_type") not in {
+            "strategy-opening",
+            "strategy-tts",
+        }:
+            return pcm_bytes
+        if stream_info.get("leading_silence_trim_done"):
+            return pcm_bytes
+
+        try:
+            rms = audioop.rms(pcm_bytes, 2)
+            sample_rate = max(
+                1,
+                int(stream_info.get("target_sample_rate") or self.sample_rate or 8000),
+            )
+            preroll_bytes = max(0, int(sample_rate * (preroll_ms / 1000.0) * 2))
+            seen_bytes = int(stream_info.get("leading_silence_seen_bytes", 0)) + len(pcm_bytes)
+            stream_info["leading_silence_seen_bytes"] = seen_bytes
+
+            if rms <= threshold_rms:
+                tail = bytes(stream_info.get("leading_silence_tail") or b"") + pcm_bytes
+                stream_info["leading_silence_tail"] = tail[-preroll_bytes:] if preroll_bytes else b""
+                return b""
+
+            tail = bytes(stream_info.pop("leading_silence_tail", b"") or b"")
+            stream_info["leading_silence_trim_done"] = True
+            trimmed_bytes = max(0, seen_bytes - len(pcm_bytes) - len(tail))
+            stream_info["leading_silence_trimmed_bytes"] = trimmed_bytes
+            logger.info(
+                "Strategy TTS leading silence trimmed",
+                call_id=call_id,
+                trimmed_ms=round(trimmed_bytes * 1000.0 / (sample_rate * 2), 1),
+                preroll_ms=preroll_ms,
+                first_audio_rms=rms,
+            )
+            return tail + pcm_bytes
+        except Exception:
+            stream_info["leading_silence_trim_done"] = True
+            logger.debug(
+                "Strategy TTS leading silence trim failed",
+                call_id=call_id,
+                exc_info=True,
+            )
             return pcm_bytes
 
     def _apply_normalizer(self, pcm_bytes: bytes, target_rms: int, max_gain_db: float) -> bytes:
@@ -3180,7 +3254,13 @@ class StreamingPlaybackManager:
                         error=str(e))
 
     
-    async def stop_streaming_playback(self, call_id: str) -> bool:
+    async def stop_streaming_playback(
+        self,
+        call_id: str,
+        *,
+        drain: bool = False,
+        drain_timeout: float = 120.0,
+    ) -> bool:
         """Stop streaming playback for a call."""
         try:
             stream_info = self.active_streams.get(call_id)
@@ -3188,27 +3268,104 @@ class StreamingPlaybackManager:
                 logger.warning("No active streaming to stop", call_id=call_id)
                 return False
             stream_id = stream_info.get('stream_id') or ''
-            # Cancel streaming task
-            try:
+
+            if drain:
                 task = stream_info.get('streaming_task')
-                if task:
-                    task.cancel()
-            except Exception:
-                pass
-            # Cancel pacer task
-            try:
-                ptask = stream_info.get('pacer_task')
-                if ptask:
-                    ptask.cancel()
-            except Exception:
-                pass
-            # Cancel keepalive task
-            if call_id in self.keepalive_tasks:
+                if task and not task.done():
+                    stop_waiter: Optional[asyncio.Task] = None
+                    try:
+                        stop_event = stream_info.get('stop_event')
+                        if isinstance(stop_event, asyncio.Event):
+                            stop_waiter = asyncio.create_task(stop_event.wait())
+                            await asyncio.wait(
+                                {task, stop_waiter},
+                                timeout=max(0.5, float(drain_timeout)),
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                            if stop_event.is_set():
+                                logger.info(
+                                    "Streaming drain interrupted by explicit stop",
+                                    call_id=call_id,
+                                    stream_id=stream_id,
+                                )
+                                return False
+                            if not task.done():
+                                raise asyncio.TimeoutError
+                            await task
+                        else:
+                            await asyncio.wait_for(
+                                asyncio.shield(task),
+                                timeout=max(0.5, float(drain_timeout)),
+                            )
+                        logger.info(
+                            "Streaming playback drained",
+                            call_id=call_id,
+                            stream_id=stream_id,
+                        )
+                        return True
+                    except (asyncio.TimeoutError, TypeError, ValueError):
+                        logger.warning(
+                            "Streaming drain timed out; aborting playback",
+                            call_id=call_id,
+                            stream_id=stream_id,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.debug(
+                            "Streaming drain failed; aborting playback",
+                            call_id=call_id,
+                            stream_id=stream_id,
+                            exc_info=True,
+                        )
+                    finally:
+                        if stop_waiter and not stop_waiter.done():
+                            stop_waiter.cancel()
+                            with suppress(asyncio.CancelledError):
+                                await stop_waiter
+
+            cancelled_tasks = []
+            seen_tasks = set()
+
+            stop_event = stream_info.get('stop_event')
+            if isinstance(stop_event, asyncio.Event):
+                stop_event.set()
+
+            def _cancel_task(task: Any) -> None:
+                if not task or not hasattr(task, "cancel"):
+                    return
+                task_id = id(task)
+                if task_id in seen_tasks:
+                    return
+                seen_tasks.add(task_id)
                 try:
-                    self.keepalive_tasks[call_id].cancel()
+                    if not task.done():
+                        task.cancel()
+                        cancelled_tasks.append(task)
                 except Exception:
                     pass
-                self.keepalive_tasks.pop(call_id, None)
+
+            _cancel_task(stream_info.get('streaming_task'))
+            _cancel_task(stream_info.get('pacer_task'))
+            _cancel_task(stream_info.get('keepalive_task'))
+            _cancel_task(self.keepalive_tasks.pop(call_id, None))
+
+            if cancelled_tasks:
+                try:
+                    _, pending = await asyncio.wait(cancelled_tasks, timeout=2.0)
+                    if pending:
+                        logger.debug(
+                            "Streaming stop tasks did not settle before cleanup",
+                            call_id=call_id,
+                            stream_id=stream_id,
+                            pending_tasks=len(pending),
+                        )
+                except Exception:
+                    logger.debug(
+                        "Failed while waiting for streaming stop tasks",
+                        call_id=call_id,
+                        exc_info=True,
+                    )
             # Cleanup resources and emit summaries
             await self._cleanup_stream(call_id, stream_id)
             logger.info("🎵 STREAMING PLAYBACK - Stopped", call_id=call_id, stream_id=stream_id)
@@ -3294,6 +3451,15 @@ class StreamingPlaybackManager:
 
     async def _cleanup_stream(self, call_id: str, stream_id: str) -> None:
         """Clean up streaming resources."""
+        current_stream = self.active_streams.get(call_id)
+        if current_stream is not None and not self._stream_owns_slot(call_id, stream_id):
+            logger.debug(
+                "Skipping cleanup for replaced stream",
+                call_id=call_id,
+                stream_id=stream_id,
+                active_stream_id=current_stream.get('stream_id'),
+            )
+            return
         if call_id in self._cleanup_in_progress:
             return
         self._cleanup_in_progress.add(call_id)
@@ -3625,7 +3791,8 @@ class StreamingPlaybackManager:
             except Exception:
                 logger.debug("Streaming tuning summary unavailable", call_id=call_id)
             # Remove from active streams
-            if call_id in self.active_streams:
+            current_stream = self.active_streams.get(call_id)
+            if current_stream is not None and self._stream_owns_slot(call_id, stream_id):
                 del self.active_streams[call_id]
             self._refresh_streaming_summary_metrics()
             # Record last segment end timestamp for adaptive gating of next segment
@@ -3673,11 +3840,17 @@ class StreamingPlaybackManager:
         """Generate deterministic stream ID."""
         timestamp = int(time.time() * 1000)
         return f"stream:{playback_type}:{call_id}:{timestamp}"
+
+    def _stream_owns_slot(self, call_id: str, stream_id: str) -> bool:
+        info = self.active_streams.get(call_id)
+        return bool(info is not None and info.get('stream_id') == stream_id)
     
-    def is_stream_active(self, call_id: str) -> bool:
-        """Return True if a streaming playback is active for the call."""
+    def is_stream_active(self, call_id: str, stream_id: Optional[str] = None) -> bool:
+        """Return True if the requested streaming playback is active."""
         info = self.active_streams.get(call_id)
         if not info:
+            return False
+        if stream_id is not None and info.get('stream_id') != stream_id:
             return False
         task = info.get('streaming_task')
         return task is not None and not task.done()

@@ -88,6 +88,7 @@ class LocalProviderConfig(BaseModel):
     auth_token: Optional[str] = None
     connect_timeout_sec: float = Field(default=5.0)
     response_timeout_sec: float = Field(default=5.0)
+    binary_idle_timeout_sec: float = Field(default=3.0, ge=0.5, le=30.0)
     # Farewell mode: how to play goodbye message when call ends
     # "tts" - Use local TTS (best for fast hardware with <5s LLM response)
     # "asterisk" - Use Asterisk's built-in goodbye sound (reliable for slow hardware)
@@ -1149,9 +1150,10 @@ def _merge_external_contexts(config_data: Dict[str, Any]) -> None:
                 continue
 
             name = ctx_data.get("name")
-            if not isinstance(name, str) or not name.strip():
-                continue
-            name = name.strip()
+            if isinstance(name, str) and name.strip():
+                name = name.strip()
+            else:
+                name = os.path.splitext(os.path.basename(ctx_path))[0]
 
             # Map system_prompt → prompt if prompt not explicitly provided
             if "prompt" not in ctx_data and "system_prompt" in ctx_data:

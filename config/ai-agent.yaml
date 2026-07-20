@@ -17,8 +17,9 @@ barge_in:
   pipeline_talk_detect_enabled: true
   pipeline_talk_detect_silence_ms: 1200
   pipeline_talk_detect_talking_threshold: 256
+  talk_detect_initial_protection_ms: 800
   post_tts_end_protection_ms: 250
-  greeting_protection_ms: 5000
+  greeting_protection_ms: 1200
   provider_fallback_enabled: true
   provider_fallback_providers:
     - google_live
@@ -1174,7 +1175,7 @@ contexts:
       - send_email_summary
       - request_transcript
       - google_calendar
-    background_music: jingle
+    background_music: default
   demo_aviation_atis:
     greeting: >-
       Hello, this is the aviation automatic terminal information service. I can
@@ -1347,6 +1348,9 @@ pipelines:
     llm: native_llm
     options:
       llm:
+        # Smart Turn already emits completed utterances; keep only a tiny
+        # coalescing window here so AVA does not add another two-second wait.
+        aggregation_timeout_sec: 0.15
         base_url: http://host.docker.internal:8080/v1
         max_tokens: 200
         model: mlx-community/Qwen3-8B-4bit
@@ -1355,13 +1359,13 @@ pipelines:
           chat_template_kwargs:
             enable_thinking: false
       stt:
-        ws_url: ${LOCAL_WS_URL:-ws://127.0.0.1:8765}
+        ws_url: ${LOCAL_WS_URL:-ws://127.0.0.1:18765}
         chunk_ms: 160
         mode: stt
         stream_format: pcm16_16k
         streaming: true
       tts:
-        ws_url: ${LOCAL_WS_URL:-ws://127.0.0.1:8765}
+        ws_url: ${LOCAL_WS_URL:-ws://127.0.0.1:18765}
         mode: tts
         response_timeout_sec: 30
         format:
@@ -1379,6 +1383,7 @@ pipelines:
         model: llama-3.3-70b-versatile
         temperature: 0.7
       stt:
+        ws_url: ${LOCAL_WS_URL:-ws://127.0.0.1:18765}
         chunk_ms: 160
         mode: stt
         stream_format: pcm16_16k
@@ -1399,6 +1404,7 @@ pipelines:
     tts: elevenlabs_tts
     options:
       stt:
+        ws_url: ${LOCAL_WS_URL:-ws://127.0.0.1:18765}
         chunk_ms: 160
         mode: stt
         streaming: true
@@ -1538,8 +1544,8 @@ providers:
     vad_silence_duration_ms: 500
   local:
     # Local AI Server WebSocket URL. Bridge network uses container name.
-    base_url: ${LOCAL_WS_URL:-ws://127.0.0.1:8765}
-    ws_url: ${LOCAL_WS_URL:-ws://127.0.0.1:8765}
+    base_url: ${LOCAL_WS_URL:-ws://127.0.0.1:18765}
+    ws_url: ${LOCAL_WS_URL:-ws://127.0.0.1:18765}
     auth_token: ${LOCAL_WS_AUTH_TOKEN:-}
     capabilities:
       - stt
@@ -1575,7 +1581,7 @@ providers:
     max_tokens: 32
     temperature: 0.4
     type: local
-    ws_url: ${LOCAL_WS_URL:-ws://127.0.0.1:8765}
+    ws_url: ${LOCAL_WS_URL:-ws://127.0.0.1:18765}
   local_stt:
     auth_token: ${LOCAL_WS_AUTH_TOKEN:-}
     capabilities:
@@ -1587,7 +1593,7 @@ providers:
     stt_backend: vosk
     stt_model: models/stt/vosk-model-en-us-0.22
     type: local
-    ws_url: ${LOCAL_WS_URL:-ws://127.0.0.1:8765}
+    ws_url: ${LOCAL_WS_URL:-ws://127.0.0.1:18765}
   local_tts:
     auth_token: ${LOCAL_WS_AUTH_TOKEN:-}
     capabilities:
@@ -1596,7 +1602,7 @@ providers:
     response_timeout_sec: ${LOCAL_WS_RESPONSE_TIMEOUT:=10.0}
     tts_voice: models/tts/en_US-lessac-medium.onnx
     type: local
-    ws_url: ${LOCAL_WS_URL:-ws://127.0.0.1:8765}
+    ws_url: ${LOCAL_WS_URL:-ws://127.0.0.1:18765}
   native_llm:
     capabilities:
       - llm

@@ -1,6 +1,8 @@
 import asyncio
 import base64
 import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -194,6 +196,68 @@ async def test_local_tts_adapter_synthesizes(monkeypatch):
     assert tts_message["type"] == "tts_request"
     assert tts_message["call_id"] == "call-3"
     assert tts_message["text"] == "Hello world"
+
+
+@pytest.mark.asyncio
+async def test_local_tts_binary_stream_uses_three_second_idle_grace_by_default():
+    adapter = object.__new__(LocalTTSAdapter)
+    adapter.component_key = "local_tts"
+    adapter._sessions = {"call-gap": SimpleNamespace()}
+    adapter.close_call = AsyncMock()
+    adapter._ensure_session = AsyncMock(return_value=adapter._sessions["call-gap"])
+    adapter._send_json_with_retry = AsyncMock()
+    adapter._compose_options = lambda _options: {"response_timeout_sec": 8.0}
+    receive_timeouts = []
+
+    async def fake_recv(_session, timeout):
+        receive_timeouts.append(timeout)
+        if len(receive_timeouts) == 1:
+            return "binary", b"audio"
+        return "json", {"type": "tts_audio", "is_final_chunk": True}
+
+    adapter._recv_any = fake_recv
+
+    chunks = [
+        chunk
+        async for chunk in adapter._synthesize_locked("call-gap", "hello", {})
+    ]
+
+    assert chunks == [b"audio"]
+    assert receive_timeouts == [8.0, 3.0]
+
+
+@pytest.mark.asyncio
+async def test_local_tts_accepts_is_final_metadata_alias():
+    adapter = object.__new__(LocalTTSAdapter)
+    adapter.component_key = "local_tts"
+    adapter._sessions = {"call-final": SimpleNamespace()}
+    adapter.close_call = AsyncMock()
+    adapter._ensure_session = AsyncMock(return_value=adapter._sessions["call-final"])
+    adapter._send_json_with_retry = AsyncMock()
+    adapter._compose_options = lambda _options: {"response_timeout_sec": 8.0}
+    receive_count = 0
+
+    async def fake_recv(_session, _timeout):
+        nonlocal receive_count
+        receive_count += 1
+        if receive_count == 1:
+            return "binary", b"audio"
+        if receive_count == 2:
+            return "json", {"type": "tts_audio", "is_final": True}
+        raise AssertionError("TTS client ignored the explicit final marker")
+
+    adapter._recv_any = fake_recv
+
+    chunks = [
+        chunk
+        async for chunk in adapter._synthesize_locked("call-final", "hello", {})
+    ]
+
+    assert chunks == [b"audio"]
+    assert receive_count == 2
+    sent_payload = adapter._send_json_with_retry.await_args.args[1]
+    assert sent_payload["request_id"]
+    assert sent_payload["response_format"] == "binary"
 
 
 @pytest.mark.asyncio
