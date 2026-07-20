@@ -69,6 +69,11 @@ from .core.vad_manager import EnhancedVADManager, VADResult
 from .core.streaming_playback_manager import StreamingPlaybackManager
 from .core.transport_orchestrator import TransportOrchestrator, TransportProfile
 from .core.models import CallSession
+from .strategy_v1 import (
+    StrategyV1Error,
+    StrategyV1SessionManager,
+    normalize_strategy_tts_text,
+)
 from .core.outbound_store import get_outbound_store
 from .utils.audio_capture import AudioCaptureManager
 from src.pipelines.base import LLMResponse
@@ -80,6 +85,10 @@ from src.tools.telephony.hangup_policy import (
 )
 
 logger = get_logger(__name__)
+
+
+class _PipelinePlaybackInterrupted(RuntimeError):
+    """The caller interrupted a pipeline stream while TTS was producing it."""
 
 # -----------------------------------------------------------------------------
 # Environment variable resolution helper
@@ -289,15 +298,24 @@ class Engine:
         self._outbound_dial_prefix = str(os.getenv("AAVA_OUTBOUND_DIAL_PREFIX", "")).strip()
         self._outbound_channel_tech = str(os.getenv("AAVA_OUTBOUND_CHANNEL_TECH", "auto")).strip().lower() or "auto"
         self._outbound_pbx_type = str(os.getenv("AAVA_OUTBOUND_PBX_TYPE", "freepbx")).strip().lower() or "freepbx"
-        self._voiceai_backend_base_url = str(os.getenv("VOICEAI_BACKEND_BASE_URL", "http://127.0.0.1:8000")).rstrip("/")
+        voiceai_backend_url_raw = os.getenv("VOICEAI_BACKEND_BASE_URL") or "http://127.0.0.1:8000"
+        self._voiceai_backend_base_url = str(voiceai_backend_url_raw).split(",")[0].strip().rstrip("/")
         self._voiceai_backend_token = str(os.getenv("VOICEAI_BACKEND_AUTH_TOKEN") or os.getenv("LOCAL_WS_AUTH_TOKEN") or "").strip()
-        self._voiceai_audio_monitor_enabled = str(os.getenv("VOICEAI_AUDIO_MONITOR_ENABLED", "1")).lower() not in ("0", "false", "no")
+        self.strategy_session_manager = StrategyV1SessionManager(
+            event_callback=self._on_strategy_runtime_event,
+        )
+        self._voiceai_audio_monitor_enabled = str(os.getenv("VOICEAI_AUDIO_MONITOR_ENABLED", "0")).lower() not in ("0", "false", "no")
         self._voiceai_audio_monitor_min_bytes = int(os.getenv("VOICEAI_AUDIO_MONITOR_MIN_BYTES", "16000") or "16000")
         self._voiceai_audio_monitor_buffers: Dict[str, bytearray] = {}
         self._voiceai_audio_monitor_buffer_segments: Dict[str, str] = {}
         self._voiceai_assistant_segment_ids: Dict[str, str] = {}
         self._voiceai_last_assistant_segment_ids: Dict[str, str] = {}
         self._voiceai_last_assistant_segment_done_ts: Dict[str, float] = {}
+        self._voiceai_transcript_sinks: Dict[str, str] = {}
+        self._voiceai_transcript_queue: asyncio.Queue = asyncio.Queue(
+            maxsize=int(os.getenv("VOICEAI_TRANSCRIPT_QUEUE_MAXSIZE", "200") or "200")
+        )
+        self._voiceai_transcript_worker_task: Optional[asyncio.Task] = None
         
         # Initialize streaming playback manager
         streaming_config = {}
@@ -658,6 +676,12 @@ class Engine:
         """Start the engine and ARI reconnect supervisor."""
         # 1) Load providers first (low risk)
         await self._load_providers()
+        if self._voiceai_transcript_worker_task is None or self._voiceai_transcript_worker_task.done():
+            self._voiceai_transcript_worker_task = asyncio.create_task(
+                self._voiceai_transcript_worker(),
+                name="voiceai-transcript-worker",
+            )
+            self._voiceai_transcript_worker_task.add_done_callback(self._log_task_exception)
         
         # Initialize tool calling system
         try:
@@ -1466,6 +1490,7 @@ class Engine:
 
         channel_vars: Dict[str, Any] = {
             "AAVA_OUTBOUND": "1",
+            "VOICEAI_CALL_KIND": "campaign",
             "AAVA_CAMPAIGN_ID": campaign_id,
             "AAVA_LEAD_ID": lead_id,
             "AAVA_ATTEMPT_ID": attempt_id,
@@ -1509,6 +1534,7 @@ class Engine:
             "AAVA_LEAD_ID",
             "AAVA_ATTEMPT_ID",
             "AAVA_OUTBOUND_PHONE",
+            "VOICEAI_CALL_KIND",
             "AI_CONTEXT",
             "AI_PROVIDER",
             "AAVA_VM_ENABLED",
@@ -2076,6 +2102,9 @@ class Engine:
         # Stop outbound scheduler early (it will see cancellation and exit).
         try:
             task = getattr(self, "_outbound_scheduler_task", None)
+            if task:
+                task.cancel()
+            task = getattr(self, "_voiceai_transcript_worker_task", None)
             if task:
                 task.cancel()
         except Exception:
@@ -3254,6 +3283,8 @@ class Engine:
                        call_id=caller_channel_id,
                        called_number=session.called_number)
 
+            await self._bind_voiceai_transcript_sink_from_channel(caller_channel_id)
+
             # If outbound, pull outbound metadata from channel vars (set during origination).
             if is_outbound:
                 try:
@@ -3751,6 +3782,8 @@ class Engine:
 
             self.audiosocket_channels[caller_channel_id] = audiosocket_channel_id
             self.bridges[audiosocket_channel_id] = bridge_id
+
+            await self._start_context_background_music(session, session.context_name)
 
             if not session.provider_session_active:
                 await self._ensure_provider_session_started(caller_channel_id)
@@ -5636,8 +5669,13 @@ class Engine:
             except Exception:
                 pass
 
-            await self._apply_barge_in_action(call_id, source="talkdetect", reason="ChannelTalkingStarted")
-            logger.info("🎧 BARGE-IN (TalkDetect) triggered", call_id=call_id, channel_id=channel_id)
+            applied = await self._apply_barge_in_action(
+                call_id,
+                source="talkdetect",
+                reason="ChannelTalkingStarted",
+            )
+            if applied:
+                logger.info("🎧 BARGE-IN (TalkDetect) triggered", call_id=call_id, channel_id=channel_id)
         except Exception:
             logger.debug("ChannelTalkingStarted handler failed", ari_event=event, exc_info=True)
 
@@ -5714,6 +5752,7 @@ class Engine:
 
             call_id = session.call_id
             resolved_call_id = call_id  # Save for finally block
+            self._schedule_voiceai_transcript_sink_cleanup(call_id)
 
             # Completed guard: some late events (e.g., streaming/playback teardown) can re-upsert
             # the session after cleanup, which may cause cleanup (and email sends) to run twice.
@@ -5929,6 +5968,11 @@ class Engine:
                 self._pipeline_forced.pop(call_id, None)
             except Exception:
                 logger.debug("Pipeline cleanup failed", call_id=call_id, exc_info=True)
+
+            try:
+                await self.strategy_session_manager.end(call_id)
+            except Exception:
+                logger.debug("Strategy session cleanup failed", call_id=call_id, exc_info=True)
 
             # Clear per-call resample states to prevent unbounded memory growth
             self._resample_state_provider_in.pop(call_id, None)
@@ -8035,7 +8079,34 @@ class Engine:
         first_barge_min = int(getattr(cfg, "local_first_barge_min_ms", 80) or 80)
         return max(40, min(base_min, first_barge_min))
 
-    async def _apply_barge_in_action(self, call_id: str, *, source: str, reason: str) -> None:
+    async def _put_pipeline_stream_chunk(
+        self,
+        call_id: str,
+        stream_id: str,
+        queue: asyncio.Queue,
+        chunk: Optional[bytes],
+        *,
+        wait_slice_sec: float = 0.25,
+    ) -> None:
+        """Write only to the live stream that owns this pipeline turn.
+
+        TTS can produce audio faster than telephony consumes it. If barge-in
+        cancels playback while the queue is full, an unbounded ``queue.put``
+        leaves the dialog worker stuck and later turns are never processed.
+        """
+        timeout = max(0.05, float(wait_slice_sec))
+        while True:
+            if not self.streaming_playback_manager.is_stream_active(call_id, stream_id):
+                raise _PipelinePlaybackInterrupted(
+                    f"pipeline stream {stream_id} is no longer active"
+                )
+            try:
+                await asyncio.wait_for(queue.put(chunk), timeout=timeout)
+                return
+            except asyncio.TimeoutError:
+                continue
+
+    async def _apply_barge_in_action(self, call_id: str, *, source: str, reason: str) -> bool:
         """Apply platform-owned barge-in actions (flush local output only).
 
         Contract (Option 2):
@@ -8046,7 +8117,7 @@ class Engine:
         try:
             session = await self.session_store.get_by_call_id(call_id)
             if not session:
-                return
+                return False
 
             if not bool(getattr(session, "media_rx_confirmed", False)):
                 logger.debug(
@@ -8055,9 +8126,23 @@ class Engine:
                     source=source,
                     reason=reason,
                 )
-                return
+                return False
 
-            # Stop/flush streaming playback first (prevents tail audio).
+            # Mark the external text turn stale before stopping AVA playback.
+            # Otherwise the stream can disappear while its producer still sees
+            # an active strategy turn and misclassifies barge-in as a failure.
+            try:
+                stale_turn_id = self.strategy_session_manager.mark_barge_in(call_id)
+                if stale_turn_id:
+                    logger.info(
+                        "Strategy turn marked stale for barge-in",
+                        call_id=call_id,
+                        turn_id=stale_turn_id,
+                    )
+            except Exception:
+                logger.debug("Strategy barge-in state update failed", call_id=call_id, exc_info=True)
+
+            # Stop/flush streaming playback immediately (prevents tail audio).
             # Mark end_reason so cleanup skips remainder flush (avoids oversized RTP packets).
             try:
                 _sinfo = self.streaming_playback_manager.active_streams.get(call_id)
@@ -8145,8 +8230,10 @@ class Engine:
                 logger.debug("Failed to notify local provider about barge-in", call_id=call_id, exc_info=True)
 
             logger.info("🎧 BARGE-IN action applied", call_id=call_id, source=source, reason=reason)
+            return True
         except Exception:
             logger.error("Barge-in action failed", call_id=call_id, source=source, reason=reason, exc_info=True)
+            return False
 
     async def _export_config_metrics(self, call_id: str) -> None:
         """Expose configured knobs as Prometheus gauges (aggregate, no per-call labels)."""
@@ -10350,31 +10437,151 @@ class Engine:
     ) -> None:
         if not call_id or not text:
             return
-        if not self._voiceai_backend_token:
-            logger.debug("Skipping transcript publish: backend token missing", call_id=call_id, source=source)
+        event = {
+            "call_id": call_id,
+            "role": role,
+            "content": text,
+            "source": source,
+            "segment_id": segment_id,
+            "backend": self._resolve_voiceai_transcript_sink(call_id),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "final": True,
+        }
+        try:
+            self._voiceai_transcript_queue.put_nowait(event)
+        except asyncio.QueueFull:
+            try:
+                self._voiceai_transcript_queue.get_nowait()
+                self._voiceai_transcript_queue.task_done()
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                self._voiceai_transcript_queue.put_nowait(event)
+            except asyncio.QueueFull:
+                logger.warning("VoiceAI transcript publish dropped: queue full", call_id=call_id, source=source)
+
+    async def _on_strategy_runtime_event(self, call_id: str, event: Dict[str, Any]) -> None:
+        self._fire_and_forget(
+            self._deliver_strategy_runtime_event(call_id, event),
+            name=f"strategy-event-{call_id}-{event.get('event_type', 'unknown')}",
+        )
+
+    async def _deliver_strategy_runtime_event(self, call_id: str, event: Dict[str, Any]) -> None:
+        if not call_id or not self._voiceai_backend_token:
             return
-        url = f"{self._voiceai_backend_base_url}/api/v1/calls/{call_id}/transcript/internal"
-        payload = {"role": role, "content": text, "source": source}
-        if segment_id:
-            payload["segment_id"] = segment_id
+        base_url = self._resolve_voiceai_transcript_sink(call_id)
+        if not base_url:
+            return
         headers = {
             "Content-Type": "application/json",
             "X-AI-Engine-Token": self._voiceai_backend_token,
         }
         try:
+            async with ClientSession() as http:
+                async with http.post(
+                    f"{base_url}/api/v1/calls/{call_id}/strategy-events/internal",
+                    json=event,
+                    headers=headers,
+                    timeout=3,
+                ) as response:
+                    if response.status == 404:
+                        logger.debug("Strategy event skipped: call not found", call_id=call_id)
+                    elif response.status >= 400:
+                        logger.warning(
+                            "Strategy event publish failed",
+                            call_id=call_id,
+                            event_type=event.get("event_type"),
+                            status=response.status,
+                        )
+        except Exception:
+            logger.warning(
+                "Strategy event publish exception",
+                call_id=call_id,
+                event_type=event.get("event_type"),
+                exc_info=True,
+            )
+
+    async def _voiceai_transcript_worker(self) -> None:
+        while True:
+            event = await self._voiceai_transcript_queue.get()
+            try:
+                await self._deliver_transcript_to_voiceai(event)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "VoiceAI transcript worker exception",
+                    call_id=event.get("call_id"),
+                    source=event.get("source"),
+                    exc_info=True,
+                )
+            finally:
+                self._voiceai_transcript_queue.task_done()
+
+    async def _deliver_transcript_to_voiceai(self, event: Dict[str, Any]) -> None:
+        call_id = str(event.get("call_id") or "")
+        role = str(event.get("role") or "")
+        text = str(event.get("content") or "")
+        source = str(event.get("source") or "")
+        if not call_id or not role or not text:
+            return
+        if not self._voiceai_backend_token:
+            logger.debug("Skipping transcript publish: backend token missing", call_id=call_id, source=source)
+            return
+        base_url = self._sanitize_voiceai_backend_url(event.get("backend")) or self._resolve_voiceai_transcript_sink(call_id)
+        if not base_url:
+            logger.debug("Skipping transcript publish: no backend sink", call_id=call_id, source=source)
+            return
+        payload = {
+            "role": role,
+            "content": text,
+            "source": source,
+            "timestamp": event.get("timestamp"),
+            "final": bool(event.get("final", True)),
+        }
+        segment_id = event.get("segment_id")
+        if segment_id:
+            payload["segment_id"] = str(segment_id)
+        headers = {
+            "Content-Type": "application/json",
+            "X-AI-Engine-Token": self._voiceai_backend_token,
+        }
+        url = f"{base_url}/api/v1/calls/{call_id}/transcript/internal"
+        try:
             async with ClientSession() as session:
-                async with session.post(url, json=payload, headers=headers, timeout=5) as response:
-                    if response.status >= 400:
+                async with session.post(url, json=payload, headers=headers, timeout=2) as response:
+                    if response.status == 404:
+                        logger.debug(
+                            "VoiceAI transcript publish skipped: call not found in backend",
+                            call_id=call_id,
+                            source=source,
+                            backend=base_url,
+                        )
+                    elif response.status >= 400:
                         body = await response.text()
                         logger.warning(
                             "VoiceAI transcript publish failed",
                             call_id=call_id,
                             source=source,
+                            backend=base_url,
                             status=response.status,
                             body=body[:200],
                         )
+                    else:
+                        logger.debug(
+                            "VoiceAI transcript publish ok",
+                            call_id=call_id,
+                            source=source,
+                            backend=base_url,
+                        )
         except Exception:
-            logger.warning("VoiceAI transcript publish exception", call_id=call_id, source=source, exc_info=True)
+            logger.warning(
+                "VoiceAI transcript publish exception",
+                call_id=call_id,
+                source=source,
+                backend=base_url,
+                exc_info=True,
+            )
 
     async def _publish_audio_to_voiceai(
         self,
@@ -10440,7 +10647,9 @@ class Engine:
         sample_rate: Optional[int] = None,
         segment_id: Optional[str] = None,
     ) -> None:
-        url = f"{self._voiceai_backend_base_url}/api/v1/calls/{call_id}/audio/internal"
+        base_url = self._resolve_voiceai_transcript_sink(call_id)
+        if not base_url:
+            return
         payload = {
             "role": role,
             "audio_base64": base64.b64encode(payload_audio).decode("ascii"),
@@ -10453,14 +10662,22 @@ class Engine:
             "Content-Type": "application/json",
             "X-AI-Engine-Token": self._voiceai_backend_token,
         }
+        url = f"{base_url}/api/v1/calls/{call_id}/audio/internal"
         try:
             async with ClientSession() as session:
                 async with session.post(url, json=payload, headers=headers, timeout=5) as response:
-                    if response.status >= 400:
+                    if response.status == 404:
+                        logger.debug(
+                            "VoiceAI audio publish skipped: call not found in backend",
+                            call_id=call_id,
+                            backend=base_url,
+                        )
+                    elif response.status >= 400:
                         body = await response.text()
                         logger.warning(
                             "VoiceAI audio publish failed",
                             call_id=call_id,
+                            backend=base_url,
                             status=response.status,
                             body=body[:200],
                         )
@@ -10468,12 +10685,68 @@ class Engine:
                         logger.info(
                             "VoiceAI audio publish ok",
                             call_id=call_id,
+                            backend=base_url,
                             bytes=len(payload_audio),
                             encoding=payload["encoding"],
                             sample_rate=payload["sample_rate"],
                         )
         except Exception:
-            logger.warning("VoiceAI audio publish exception", call_id=call_id, exc_info=True)
+            logger.warning(
+                "VoiceAI audio publish exception",
+                call_id=call_id,
+                backend=base_url,
+                exc_info=True,
+            )
+
+    def _resolve_voiceai_transcript_sink(self, call_id: str) -> str:
+        sink = self._voiceai_transcript_sinks.get(call_id) or self._voiceai_backend_base_url
+        return self._sanitize_voiceai_backend_url(sink)
+
+    def _schedule_voiceai_transcript_sink_cleanup(self, call_id: str) -> None:
+        async def _cleanup() -> None:
+            try:
+                await asyncio.sleep(300)
+                self._voiceai_transcript_sinks.pop(call_id, None)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("VoiceAI transcript sink cleanup failed", call_id=call_id, exc_info=True)
+
+        try:
+            task = asyncio.create_task(_cleanup(), name=f"voiceai-sink-cleanup-{call_id}")
+            task.add_done_callback(self._log_task_exception)
+        except Exception:
+            logger.debug("Failed to schedule VoiceAI transcript sink cleanup", call_id=call_id, exc_info=True)
+
+    async def _bind_voiceai_transcript_sink_from_channel(self, call_id: str) -> None:
+        sink = ""
+        for var_name in ("VOICEAI_TRANSCRIPT_SINK", "VOICEAI_CALLBACK_BASE_URL"):
+            try:
+                resp = await self.ari_client.send_command(
+                    "GET",
+                    f"channels/{call_id}/variable",
+                    params={"variable": var_name},
+                    tolerate_statuses=[404],
+                )
+                if isinstance(resp, dict):
+                    sink = self._sanitize_voiceai_backend_url(resp.get("value"))
+                    if sink:
+                        break
+            except Exception:
+                logger.debug("VoiceAI transcript sink read failed", call_id=call_id, variable=var_name, exc_info=True)
+        if sink:
+            self._voiceai_transcript_sinks[call_id] = sink
+            logger.info("VoiceAI transcript sink bound", call_id=call_id, backend=sink)
+
+    @staticmethod
+    def _sanitize_voiceai_backend_url(value: Any) -> str:
+        raw = str(value or "").strip().strip('"').strip("'")
+        if not raw:
+            return ""
+        raw = raw.split(",")[0].strip().rstrip("/")
+        if not (raw.startswith("http://") or raw.startswith("https://")):
+            return ""
+        return raw
 
     def _schedule_voiceai_audio_publish(
         self,
@@ -10534,6 +10807,326 @@ class Engine:
             logger.debug("AudioSocket -> PCM16 16k conversion failed", exc_info=True)
             return audio_bytes
 
+    def _strategy_runtime_for_session(self, session: CallSession) -> Optional[Dict[str, Any]]:
+        context_name = str(getattr(session, "context_name", None) or "").strip()
+        contexts = getattr(self.config, "contexts", {}) or {}
+        context = contexts.get(context_name) if isinstance(contexts, dict) else None
+        if not isinstance(context, dict):
+            return None
+        runtime = context.get("strategy_runtime")
+        if not isinstance(runtime, dict):
+            return None
+        if not runtime.get("enabled") or str(runtime.get("mode") or "") != "real":
+            return None
+        return dict(runtime)
+
+    async def _strategy_call_variables(self, session: CallSession) -> Dict[str, Any]:
+        channel_id = getattr(session, "caller_channel_id", None) or session.call_id
+        raw: Dict[str, Any] = {}
+        for var_name in (
+            "VOICEAI_CALL_KIND",
+            "VOICEAI_CUSTOMER_NAME",
+            "VOICEAI_CUSTOMER_TITLE",
+            "VOICEAI_CUSTOMER_DATA",
+            "VOICEAI_CAMPAIGN_ID",
+        ):
+            try:
+                response = await self.ari_client.send_command(
+                    "GET",
+                    f"channels/{channel_id}/variable",
+                    params={"variable": var_name},
+                    tolerate_statuses=[404],
+                )
+                if isinstance(response, dict):
+                    value = response.get("value")
+                    if value not in (None, ""):
+                        raw[var_name] = value
+            except Exception:
+                logger.debug("Strategy channel variable read failed", call_id=session.call_id, variable=var_name)
+        customer_data: Dict[str, Any] = {}
+        try:
+            parsed = json.loads(str(raw.get("VOICEAI_CUSTOMER_DATA") or "{}"))
+            if isinstance(parsed, dict):
+                customer_data = parsed
+        except Exception:
+            customer_data = {}
+        customer_name = str(
+            raw.get("VOICEAI_CUSTOMER_NAME")
+            or customer_data.get("customer_name")
+            or customer_data.get("客户姓名")
+            or getattr(session, "caller_name", None)
+            or ""
+        )
+        phone_number = str(
+            customer_data.get("phone_number")
+            or customer_data.get("手机号")
+            or getattr(session, "caller_number", None)
+            or ""
+        )
+        values: Dict[str, Any] = {
+            **customer_data,
+            "call_kind": str(raw.get("VOICEAI_CALL_KIND") or "standard").strip().lower(),
+            "客户姓名": customer_name,
+            "customer_name": customer_name,
+            "客户称谓": str(raw.get("VOICEAI_CUSTOMER_TITLE") or customer_data.get("客户称谓") or ""),
+            "customer_title": str(raw.get("VOICEAI_CUSTOMER_TITLE") or customer_data.get("customer_title") or ""),
+            "手机号": phone_number,
+            "phone_number": phone_number,
+            "公司名": str(customer_data.get("公司名") or customer_data.get("company") or ""),
+            "company": str(customer_data.get("company") or customer_data.get("公司名") or ""),
+            "名单名称": str(customer_data.get("名单名称") or customer_data.get("list_name") or ""),
+            "list_name": str(customer_data.get("list_name") or customer_data.get("名单名称") or ""),
+            "通话时间": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M"),
+            "call_time": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M"),
+        }
+        return values
+
+    async def _play_strategy_failure(
+        self,
+        call_id: str,
+        session: CallSession,
+        pipeline: Any,
+        runtime: Dict[str, Any],
+        reason: str,
+    ) -> None:
+        failure = runtime.get("failure") if isinstance(runtime.get("failure"), dict) else {}
+        message = str(
+            failure.get("message")
+            or "抱歉，这边网络不太稳定，我稍后再联系您，再见。"
+        ).strip()
+        await self.strategy_session_manager.record_failure(call_id, reason)
+        session.error_message = str(reason or "strategy_failure")[:1000]
+        session.cleanup_after_tts = True
+        if message:
+            try:
+                await self._publish_transcript_to_voiceai(
+                    call_id,
+                    "assistant",
+                    message,
+                    "strategy_runtime_agent",
+                    segment_id=f"strategy-failure-{uuid.uuid4().hex[:10]}",
+                )
+                session.conversation_history.append(_ts_msg("assistant", message))
+                await self._save_session(session)
+                audio = bytearray()
+                async for chunk in pipeline.tts_adapter.synthesize(call_id, message, pipeline.tts_options):
+                    if chunk:
+                        audio.extend(chunk)
+                if audio:
+                    playback_id = await self.playback_manager.play_audio(call_id, bytes(audio), "strategy-failure")
+                    if playback_id:
+                        await self.playback_manager.wait_for_playback_end(
+                            call_id,
+                            playback_id,
+                            timeout_sec=(len(audio) / 8000.0 + 4.0),
+                        )
+            except Exception:
+                logger.error("Strategy failure speech playback failed", call_id=call_id, exc_info=True)
+        try:
+            await self.ari_client.hangup_channel(getattr(session, "caller_channel_id", None) or call_id)
+        except Exception:
+            logger.error("Strategy failure hangup failed", call_id=call_id, exc_info=True)
+
+    async def _run_strategy_pipeline_turn(
+        self,
+        call_id: str,
+        session: CallSession,
+        pipeline: Any,
+        runtime: Dict[str, Any],
+        transcript_text: str,
+        conversation_history: List[Dict[str, Any]],
+        *,
+        hidden_input: bool = False,
+    ) -> None:
+        turn_id = f"opening-{uuid.uuid4().hex}" if hidden_input else uuid.uuid4().hex
+        stream_queue: Optional[asyncio.Queue] = None
+        stream_id: Optional[str] = None
+        tts_format = (pipeline.tts_options or {}).get("format")
+        if not isinstance(tts_format, dict):
+            tts_format = (pipeline.tts_options or {}).get("target_format")
+        if not isinstance(tts_format, dict):
+            tts_format = {}
+        source_encoding = str(tts_format.get("encoding") or tts_format.get("format") or "mulaw")
+        try:
+            source_sample_rate = int(tts_format.get("sample_rate") or tts_format.get("sample_rate_hz") or 8000)
+        except Exception:
+            source_sample_rate = 8000
+
+        response_segments: List[str] = []
+        turn_stale = False
+        playback_error: Optional[StrategyV1Error] = None
+        if not hidden_input:
+            conversation_history.append(_ts_msg("user", transcript_text))
+        try:
+            logger.info(
+                "Strategy turn waiting for first response",
+                call_id=call_id,
+                turn_id=turn_id,
+                hidden_input=hidden_input,
+            )
+            segment_stream = (
+                self.strategy_session_manager.stream_opening(call_id, transcript_text, turn_id=turn_id)
+                if hidden_input
+                else self.strategy_session_manager.stream_turn(call_id, transcript_text, turn_id=turn_id)
+            )
+            async for segment in segment_stream:
+                if self.strategy_session_manager.is_turn_stale(call_id, turn_id):
+                    turn_stale = True
+                    continue
+                segment_text = str(segment.get("text") or "").strip()
+                if not segment_text:
+                    continue
+                response_segments.append(segment_text)
+                await self._publish_transcript_to_voiceai(
+                    call_id,
+                    "assistant",
+                    segment_text,
+                    "strategy_runtime_agent",
+                    segment_id=f"{turn_id}:{segment.get('index', 0)}",
+                )
+                conversation_history.append(_ts_msg("assistant", segment_text))
+                session.last_agent_response = segment_text
+                tts_text = normalize_strategy_tts_text(segment_text)
+                if tts_text != segment_text:
+                    logger.info(
+                        "Strategy TTS trailing ellipsis normalized",
+                        call_id=call_id,
+                        turn_id=turn_id,
+                        segment_index=segment.get("index", 0),
+                    )
+                async for audio_chunk in pipeline.tts_adapter.synthesize(
+                    call_id,
+                    tts_text,
+                    pipeline.tts_options,
+                ):
+                    if self.strategy_session_manager.is_turn_stale(call_id, turn_id):
+                        turn_stale = True
+                        break
+                    if not audio_chunk:
+                        continue
+                    if stream_queue is None:
+                        stream_queue = asyncio.Queue(maxsize=256)
+                        stream_id = await self.streaming_playback_manager.start_streaming_playback(
+                            call_id,
+                            stream_queue,
+                            playback_type="strategy-opening" if hidden_input else "strategy-tts",
+                            source_encoding=source_encoding,
+                            source_sample_rate=source_sample_rate,
+                        )
+                        if not stream_id:
+                            raise StrategyV1Error("playback_unavailable", "无法启动策略语音播放")
+                        logger.info(
+                            "Strategy playback started after first audio",
+                            call_id=call_id,
+                            turn_id=turn_id,
+                            stream_id=stream_id,
+                            segment_index=segment.get("index", 0),
+                        )
+                    try:
+                        await self._put_pipeline_stream_chunk(
+                            call_id,
+                            stream_id,
+                            stream_queue,
+                            audio_chunk,
+                        )
+                    except _PipelinePlaybackInterrupted:
+                        turn_stale = self.strategy_session_manager.is_turn_stale(
+                            call_id,
+                            turn_id,
+                        )
+                        if not turn_stale:
+                            raise StrategyV1Error(
+                                "playback_interrupted",
+                                "策略回复播放被意外中断",
+                            )
+                    if turn_stale:
+                        break
+                if turn_stale:
+                    logger.info(
+                        "Strategy turn draining after barge-in",
+                        call_id=call_id,
+                        turn_id=turn_id,
+                    )
+                    continue
+            if response_segments and stream_id is None and not turn_stale:
+                raise StrategyV1Error("tts_no_audio", "策略回复没有生成可播放语音")
+            session.conversation_history = list(conversation_history)
+            if response_segments:
+                session.last_agent_response_ts = time.time()
+            await self._save_session(session)
+        finally:
+            turn_stale = turn_stale or self.strategy_session_manager.is_turn_stale(
+                call_id,
+                turn_id,
+            )
+            if stream_queue is not None and stream_id:
+                if turn_stale:
+                    if self.streaming_playback_manager.is_stream_active(call_id, stream_id):
+                        await self.streaming_playback_manager.stop_streaming_playback(call_id)
+                else:
+                    try:
+                        await self._put_pipeline_stream_chunk(
+                            call_id,
+                            stream_id,
+                            stream_queue,
+                            None,
+                        )
+                    except _PipelinePlaybackInterrupted:
+                        turn_stale = self.strategy_session_manager.is_turn_stale(
+                            call_id,
+                            turn_id,
+                        )
+                        if not turn_stale:
+                            playback_error = StrategyV1Error(
+                                "playback_interrupted",
+                                "策略回复播放在结束前被中断",
+                            )
+                    else:
+                        try:
+                            await self.streaming_playback_manager.stop_streaming_playback(
+                                call_id,
+                                drain=True,
+                            )
+                        except asyncio.CancelledError:
+                            current_task = asyncio.current_task()
+                            if current_task is not None and current_task.cancelling():
+                                raise
+                            turn_stale = self.strategy_session_manager.is_turn_stale(
+                                call_id,
+                                turn_id,
+                            )
+                            if not turn_stale:
+                                playback_error = StrategyV1Error(
+                                    "playback_interrupted",
+                                    "策略回复播放在清理时被中断",
+                                )
+            else:
+                logger.info(
+                    "Strategy turn ended without playback",
+                    call_id=call_id,
+                    turn_id=turn_id,
+                    stale=turn_stale,
+                    response_segments=len(response_segments),
+                )
+            complete_turn = getattr(
+                self.strategy_session_manager,
+                "complete_turn",
+                None,
+            )
+            if callable(complete_turn):
+                complete_turn(call_id, turn_id)
+            else:
+                clear_stale_turn = getattr(
+                    self.strategy_session_manager,
+                    "clear_stale_turn",
+                    None,
+                )
+                if callable(clear_stale_turn):
+                    clear_stale_turn(call_id, turn_id)
+        if playback_error is not None:
+            raise playback_error
+
+
     async def _ensure_pipeline_runner(self, session: CallSession, *, forced: bool = False) -> None:
         """Create per-call queue and start pipeline runner if not already started."""
         call_id = session.call_id
@@ -10577,6 +11170,7 @@ class Engine:
             if not pipeline:
                 logger.debug("Pipeline runner: no pipeline resolved", call_id=call_id)
                 return
+            strategy_runtime = self._strategy_runtime_for_session(session)
             try:
                 default_voice = None
                 overrides = dict(getattr(session, "provider_overrides", {}) or {})
@@ -10728,18 +11322,78 @@ class Engine:
                 logger.debug("STT open_call failed", call_id=call_id, exc_info=True)
             else:
                 logger.info("Pipeline STT adapter session opened", call_id=call_id)
-            try:
-                await pipeline.llm_adapter.open_call(call_id, llm_options)
-            except Exception:
-                logger.debug("LLM open_call failed", call_id=call_id, exc_info=True)
-            else:
-                logger.info("Pipeline LLM adapter session opened", call_id=call_id)
+            if not strategy_runtime:
+                try:
+                    await pipeline.llm_adapter.open_call(call_id, llm_options)
+                except Exception:
+                    logger.debug("LLM open_call failed", call_id=call_id, exc_info=True)
+                else:
+                    logger.info("Pipeline LLM adapter session opened", call_id=call_id)
             try:
                 await pipeline.tts_adapter.open_call(call_id, pipeline.tts_options)
             except Exception:
                 logger.debug("TTS open_call failed", call_id=call_id, exc_info=True)
             else:
                 logger.info("Pipeline TTS adapter session opened", call_id=call_id)
+
+            if strategy_runtime:
+                strategy_variables = await self._strategy_call_variables(session)
+                call_kind = str(strategy_variables.get("call_kind") or "standard")
+                if str(strategy_runtime.get("real_scope") or "test_only") == "test_only" and call_kind != "test":
+                    await self._play_strategy_failure(
+                        call_id,
+                        session,
+                        pipeline,
+                        strategy_runtime,
+                        "3.0 实播当前只允许测试通话",
+                    )
+                    return
+                try:
+                    await self.strategy_session_manager.start(
+                        call_id,
+                        strategy_runtime,
+                        strategy_variables,
+                    )
+                    logger.info(
+                        "Strategy V1 session started",
+                        call_id=call_id,
+                        template_version=(strategy_runtime.get("template") or {}).get("version_id"),
+                    )
+                    strategy_opening = (
+                        strategy_runtime.get("opening")
+                        if isinstance(strategy_runtime.get("opening"), dict)
+                        else {}
+                    )
+                    if str(strategy_opening.get("mode") or "strategy") == "strategy":
+                        await self._run_strategy_pipeline_turn(
+                            call_id,
+                            session,
+                            pipeline,
+                            strategy_runtime,
+                            "喂，你好？",
+                            list(session.conversation_history or []),
+                            hidden_input=True,
+                        )
+                        logger.info("Strategy V1 hidden opening completed", call_id=call_id)
+                except StrategyV1Error as exc:
+                    logger.error(
+                        "Strategy V1 session setup failed",
+                        call_id=call_id,
+                        code=exc.code,
+                        error=str(exc),
+                    )
+                    await self._play_strategy_failure(call_id, session, pipeline, strategy_runtime, f"{exc.code}: {exc}")
+                    return
+                except Exception as exc:
+                    logger.error("Strategy V1 hidden opening failed", call_id=call_id, exc_info=True)
+                    await self._play_strategy_failure(
+                        call_id,
+                        session,
+                        pipeline,
+                        strategy_runtime,
+                        f"opening_failed: {exc}",
+                    )
+                    return
 
             # Pipeline-managed initial greeting (optional)
             # Fallback chain: AI_CONTEXT → global llm_config → empty
@@ -10788,12 +11442,36 @@ class Engine:
                 )
                 greeting = ""
                 greeting_source = "error"
+
+            if strategy_runtime:
+                strategy_opening = strategy_runtime.get("opening") if isinstance(strategy_runtime.get("opening"), dict) else {}
+                greeting = (
+                    str(strategy_opening.get("fixed_message") or "").strip()
+                    if str(strategy_opening.get("mode") or "strategy") == "ava"
+                    else ""
+                )
+                greeting_source = "strategy_template"
             
             # Final pass: ensure greeting can safely reference template variables.
             if greeting:
                 greeting = self._apply_prompt_template_substitution(greeting, session)
             
             if greeting:
+                try:
+                    await self._publish_transcript_to_voiceai(
+                        call_id,
+                        "assistant",
+                        greeting,
+                        "local_pipeline_agent",
+                        segment_id=self._get_voiceai_transcript_segment_id(call_id, "assistant"),
+                    )
+                except Exception:
+                    logger.debug(
+                        "Local pipeline greeting transcript publish failed",
+                        call_id=call_id,
+                        exc_info=True,
+                    )
+
                 max_attempts = 2
                 for attempt in range(1, max_attempts + 1):
                     try:
@@ -11151,6 +11829,7 @@ class Engine:
                     tool_calls = []
                     _streaming_handled = False  # Set True when streaming overlap played audio + recorded history
                     turn_start_time = time.time()  # Track turn latency for call history
+                    voiceai_assistant_published = False
                     
                     pipeline_label = getattr(session, 'pipeline_name', None) or 'none'
                     provider_label = getattr(session, 'provider_name', None) or 'unknown'
@@ -11159,6 +11838,57 @@ class Engine:
                     # Build context with conversation history
                     # System prompt only in first turn (when history is empty)
                     context_for_llm = {"prior_messages": _sanitize_for_llm(conversation_history)}
+
+                    try:
+                        await self._publish_transcript_to_voiceai(
+                            call_id,
+                            "user",
+                            transcript_text,
+                            "local_pipeline_user",
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Local pipeline user transcript publish failed",
+                            call_id=call_id,
+                            exc_info=True,
+                        )
+
+                    if strategy_runtime:
+                        try:
+                            await self._run_strategy_pipeline_turn(
+                                call_id,
+                                session,
+                                pipeline,
+                                strategy_runtime,
+                                transcript_text,
+                                conversation_history,
+                            )
+                        except StrategyV1Error as exc:
+                            logger.error(
+                                "Strategy V1 turn failed",
+                                call_id=call_id,
+                                code=exc.code,
+                                error=str(exc),
+                            )
+                            await self._play_strategy_failure(
+                                call_id,
+                                session,
+                                pipeline,
+                                strategy_runtime,
+                                f"{exc.code}: {exc}",
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            logger.error("Strategy V1 turn unexpected failure", call_id=call_id, exc_info=True)
+                            await self._play_strategy_failure(
+                                call_id,
+                                session,
+                                pipeline,
+                                strategy_runtime,
+                                f"turn_failed: {exc}",
+                            )
+                        return
 
                     # ── Pipeline filler audio: instant ack before LLM ──
                     # Uses fire-and-forget: synthesize filler, push all chunks, send
@@ -11315,7 +12045,9 @@ class Engine:
                                                             )
                                                     except Exception:
                                                         pass
-                                                await stream_q.put(tts_chunk)
+                                                await self._put_pipeline_stream_chunk(
+                                                    call_id, stream_id, stream_q, tts_chunk
+                                                )
 
                             # Flush remaining sentence buffer
                             remainder = sentence_buffer.strip()
@@ -11328,13 +12060,14 @@ class Engine:
                                             first_tts_ts = time.time()
                                             turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
                                             session.turn_latencies_ms.append(turn_latency_ms)
-                                        await stream_q.put(tts_chunk)
+                                        await self._put_pipeline_stream_chunk(
+                                            call_id, stream_id, stream_q, tts_chunk
+                                        )
 
                             # End-of-segment sentinel
-                            try:
-                                stream_q.put_nowait(None)
-                            except asyncio.QueueFull:
-                                asyncio.create_task(stream_q.put(None))
+                            await self._put_pipeline_stream_chunk(
+                                call_id, stream_id, stream_q, None
+                            )
                             try:
                                 if t_start is not None:
                                     _TURN_RESPONSE_SECONDS.labels(pipeline_label, provider_label).observe(
@@ -11343,6 +12076,17 @@ class Engine:
                             except Exception:
                                 pass
 
+                        except _PipelinePlaybackInterrupted:
+                            logger.info(
+                                "Pipeline streaming turn interrupted; discarding remaining TTS",
+                                call_id=call_id,
+                                stream_id=stream_id,
+                            )
+                            try:
+                                await self.streaming_playback_manager.stop_streaming_playback(call_id)
+                            except Exception:
+                                pass
+                            return
                         except Exception:
                             logger.error(
                                 "Pipeline streaming overlap failed; falling through to serial path",
@@ -11365,6 +12109,21 @@ class Engine:
                         if full_response_text.strip():
                             response_text = full_response_text.strip()
                             _streaming_handled = True
+                            try:
+                                await self._publish_transcript_to_voiceai(
+                                    call_id,
+                                    "assistant",
+                                    response_text,
+                                    "local_pipeline_agent",
+                                    segment_id=self._get_voiceai_transcript_segment_id(call_id, "assistant"),
+                                )
+                                voiceai_assistant_published = True
+                            except Exception:
+                                logger.debug(
+                                    "Local pipeline assistant transcript publish failed",
+                                    call_id=call_id,
+                                    exc_info=True,
+                                )
                             conversation_history.append(_ts_msg("user", transcript_text))
                             conversation_history.append(_ts_msg("assistant", response_text))
                             session.conversation_history = list(conversation_history)
@@ -11560,6 +12319,23 @@ class Engine:
                     if not response_text and not tool_calls:
                         return
 
+                    if response_text and not voiceai_assistant_published:
+                        try:
+                            await self._publish_transcript_to_voiceai(
+                                call_id,
+                                "assistant",
+                                response_text,
+                                "local_pipeline_agent",
+                                segment_id=self._get_voiceai_transcript_segment_id(call_id, "assistant"),
+                            )
+                            voiceai_assistant_published = True
+                        except Exception:
+                            logger.debug(
+                                "Local pipeline assistant transcript publish failed",
+                                call_id=call_id,
+                                exc_info=True,
+                            )
+
                     # Update conversation history (skip if streaming path already did this)
                     if not _streaming_handled:
                         conversation_history.append(_ts_msg("user", transcript_text))
@@ -11632,18 +12408,30 @@ class Engine:
                                                 _TURN_STT_TO_TTS.labels(pipeline_label, provider_label).observe(max(0.0, first_tts_ts - t_start))
                                         except Exception:
                                             pass
-                                    await stream_q.put(tts_chunk)
+                                    await self._put_pipeline_stream_chunk(
+                                        call_id, stream_id, stream_q, tts_chunk
+                                    )
 
                                 # End-of-segment sentinel
-                                try:
-                                    stream_q.put_nowait(None)
-                                except asyncio.QueueFull:
-                                    asyncio.create_task(stream_q.put(None))
+                                await self._put_pipeline_stream_chunk(
+                                    call_id, stream_id, stream_q, None
+                                )
                                 try:
                                     if playback_id and t_start is not None:
                                         _TURN_RESPONSE_SECONDS.labels(pipeline_label, provider_label).observe(max(0.0, time.time() - t_start))
                                 except Exception:
                                     pass
+                            except _PipelinePlaybackInterrupted:
+                                logger.info(
+                                    "Pipeline streaming turn interrupted; discarding remaining TTS",
+                                    call_id=call_id,
+                                    stream_id=stream_id,
+                                )
+                                try:
+                                    await self.streaming_playback_manager.stop_streaming_playback(call_id)
+                                except Exception:
+                                    pass
+                                return
                             except Exception:
                                 logger.error("Pipeline streaming playback failed; falling back to file playback", call_id=call_id, exc_info=True)
                                 try:
@@ -12530,9 +13318,8 @@ class Engine:
                             exc_info=True,
                         )
 
-                    # Start background music if configured for this context (AAVA-89)
-                    if context_config.background_music:
-                        await self._start_background_music(session, context_config.background_music)
+                    # Background music starts after the AudioSocket channel joins
+                    # the bridge, so the caller channel is ready for channel MOH.
             
             # Note: TransportCard will be emitted by legacy code path
             
@@ -12557,6 +13344,24 @@ class Engine:
     # ─────────────────────────────────────────────────────────────────────────
     # Background Music (AAVA-89)
     # ─────────────────────────────────────────────────────────────────────────
+
+    async def _start_context_background_music(self, session, context_name: Optional[str]) -> None:
+        """Start configured context background music for provider and pipeline calls."""
+        if not context_name:
+            return
+        try:
+            context_config = self.transport_orchestrator.get_context_config(context_name)
+            moh_class = getattr(context_config, "background_music", None) if context_config else None
+            if not moh_class:
+                return
+            await self._start_background_music(session, moh_class)
+        except Exception:
+            logger.debug(
+                "Context background music start failed",
+                call_id=getattr(session, "call_id", None),
+                context=context_name,
+                exc_info=True,
+            )
     
     async def _start_background_music(self, session, moh_class: str) -> None:
         """
@@ -12571,6 +13376,16 @@ class Engine:
             moh_class: Music On Hold class name from musiconhold.conf
         """
         try:
+            existing_music = getattr(session, "music_snoop_channel_id", None)
+            if existing_music:
+                logger.debug(
+                    "Background music already active",
+                    call_id=session.call_id,
+                    music_id=existing_music,
+                    moh_class=moh_class,
+                )
+                return
+
             if not session.caller_channel_id:
                 logger.warning(
                     "Cannot start background music - no caller channel",
@@ -12578,33 +13393,31 @@ class Engine:
                     moh_class=moh_class
                 )
                 return
-            
-            # Use bridge's MOH - plays to all channels in bridge (including AI)
-            # Note: At low volume, this shouldn't significantly impact VAD
+
             if not session.bridge_id:
                 logger.warning(
                     "Cannot start background music - no bridge yet",
                     call_id=session.call_id,
-                    moh_class=moh_class
+                    moh_class=moh_class,
                 )
                 return
             
-            # Start MOH on the bridge itself
             response = await self.ari_client.send_command(
                 "POST",
                 f"bridges/{session.bridge_id}/moh",
-                data={"mohClass": moh_class}
+                params={"mohClass": moh_class},
             )
-            
-            # Store that we're using bridge MOH (for cleanup)
             session.music_snoop_channel_id = f"bridge-moh:{session.bridge_id}"
             await self._save_session(session)
             
             logger.info(
-                "🎵 Background music started (bridge MOH)",
+                "Background music started",
                 call_id=session.call_id,
+                mode="bridge MOH",
                 bridge_id=session.bridge_id,
-                moh_class=moh_class
+                caller_channel_id=session.caller_channel_id,
+                moh_class=moh_class,
+                ari_response=response,
             )
             
         except Exception as e:
@@ -13971,6 +14784,7 @@ class Engine:
             # registered in the engine's tool registry. This is intentionally unauthenticated
             # (similar to /mcp/status) and should not include secrets or PII.
             app.router.add_get('/tools/definitions', self._tools_definitions_handler)
+            app.router.add_get('/call-history/tools', self._call_history_tools_handler)
             app.router.add_get('/sessions/stats', self._sessions_stats_handler)
             runner = web.AppRunner(app)
             await runner.setup()
@@ -14062,6 +14876,74 @@ class Engine:
         except Exception as exc:
             logger.debug("Tools definitions handler failed", error=str(exc), exc_info=True)
             return web.json_response({"tools": [], "error": "internal_error"}, status=500)
+
+    async def _call_history_tools_handler(self, request):
+        """Return recent call tool execution summaries for internal admin consumers.
+
+        SECURITY: Requires localhost or HEALTH_API_TOKEN. The response deliberately
+        excludes transcript text, request bodies, headers, and raw responses.
+        """
+        if not self._is_request_authorized(request):
+            return web.json_response(
+                {"records": [], "error": "Forbidden: requires localhost or valid HEALTH_API_TOKEN"},
+                status=403
+            )
+        try:
+            try:
+                limit = max(1, min(int(request.query.get("limit", "80")), 200))
+            except Exception:
+                limit = 80
+            context_name = (request.query.get("context") or "").strip() or None
+            from src.core.call_history import get_call_history_store
+            store = get_call_history_store()
+            records = await store.list(
+                limit=limit,
+                offset=0,
+                context_name=context_name,
+                order_by="start_time",
+                order_dir="DESC",
+                include_details=True,
+            )
+
+            def _phase_entries(entries, fallback_phase):
+                out = []
+                for item in list(entries or [])[:20]:
+                    if not isinstance(item, dict):
+                        continue
+                    name = str(item.get("name") or item.get("tool") or "")
+                    if not name:
+                        continue
+                    out.append({
+                        "name": name,
+                        "phase": str(item.get("phase") or fallback_phase),
+                        "status": str(item.get("status") or ""),
+                        "duration_ms": self._safe_jsonable(item.get("duration_ms")),
+                        "http_status": self._safe_jsonable(item.get("http_status")),
+                        "message": str(item.get("error_message") or item.get("response_summary") or "")[:180],
+                    })
+                return out
+
+            payload = []
+            for record in records:
+                tool_calls = []
+                tool_calls.extend(_phase_entries(record.pre_call_tool_calls, "pre_call"))
+                tool_calls.extend(_phase_entries(record.tool_calls, "in_call"))
+                tool_calls.extend(_phase_entries(record.post_call_tool_calls, "post_call"))
+                payload.append({
+                    "call_id": str(record.call_id or ""),
+                    "caller_number": str(record.caller_number or ""),
+                    "caller_name": str(record.caller_name or ""),
+                    "start_time": record.start_time.isoformat() if getattr(record, "start_time", None) else None,
+                    "end_time": record.end_time.isoformat() if getattr(record, "end_time", None) else None,
+                    "context_name": str(record.context_name or ""),
+                    "outcome": str(record.outcome or ""),
+                    "transfer_destination": str(record.transfer_destination or ""),
+                    "tool_calls": tool_calls,
+                })
+            return web.json_response({"records": payload}, status=200)
+        except Exception as exc:
+            logger.debug("Call history tools handler failed", error=str(exc), exc_info=True)
+            return web.json_response({"records": [], "error": "internal_error"}, status=500)
 
     async def _sessions_stats_handler(self, request):
         """Return active session statistics for Admin UI (Milestone 21).
@@ -15018,6 +15900,63 @@ class Engine:
             except Exception as e:
                 logger.debug("Error rebuilding TransportOrchestrator", error=str(e), exc_info=True)
                 errors.append("Error rebuilding TransportOrchestrator (see server logs)")
+
+            # Step 2c: Re-register dynamically configured HTTP tools so Admin/UI
+            # writes become executable without a full engine restart. Built-in
+            # tools remain registered; only cenaniVoice-owned dynamic tool names
+            # are removed before reloading from the latest config.
+            try:
+                from src.tools.registry import tool_registry
+
+                tools_cfg = getattr(new_config, "tools", None) or {}
+                in_call_tools_cfg = getattr(new_config, "in_call_tools", None) or {}
+                configured_dynamic_names = set()
+                if isinstance(tools_cfg, dict):
+                    configured_dynamic_names.update(
+                        str(name)
+                        for name, cfg in tools_cfg.items()
+                        if isinstance(cfg, dict)
+                        and str(cfg.get("kind") or "") in {"generic_http_lookup", "generic_webhook"}
+                    )
+                if isinstance(in_call_tools_cfg, dict):
+                    configured_dynamic_names.update(
+                        str(name)
+                        for name, cfg in in_call_tools_cfg.items()
+                        if isinstance(cfg, dict)
+                        and str(cfg.get("kind") or "in_call_http_lookup") == "in_call_http_lookup"
+                    )
+
+                stale_dynamic = [
+                    name
+                    for name in tool_registry.list_tools()
+                    if str(name).startswith("cenani_") and name not in configured_dynamic_names
+                ]
+                if stale_dynamic:
+                    removed = tool_registry.unregister_many(stale_dynamic)
+                    changes.append(f"Dynamic HTTP tools removed ({removed})")
+
+                if hasattr(tool_registry, "_in_call_http_init_cache"):
+                    try:
+                        tool_registry._in_call_http_init_cache.clear()
+                    except Exception:
+                        pass
+
+                before_tools = set(tool_registry.list_tools())
+                if isinstance(tools_cfg, dict) and tools_cfg:
+                    tool_registry.initialize_http_tools_from_config(tools_cfg)
+                if isinstance(in_call_tools_cfg, dict) and in_call_tools_cfg:
+                    tool_registry.initialize_in_call_http_tools_from_config(in_call_tools_cfg)
+                after_tools = set(tool_registry.list_tools())
+                added_or_refreshed = sorted(configured_dynamic_names & after_tools)
+                if configured_dynamic_names:
+                    changes.append(
+                        f"Dynamic HTTP tools reloaded ({len(added_or_refreshed)}/{len(configured_dynamic_names)})"
+                    )
+                elif before_tools != after_tools:
+                    changes.append("Dynamic HTTP tool registry refreshed")
+            except Exception as e:
+                logger.debug("Error reloading dynamic HTTP tools", error=str(e), exc_info=True)
+                errors.append(f"Error reloading dynamic HTTP tools: {str(e)}")
             
             # Step 3: Reinitialize providers that have changed
             try:

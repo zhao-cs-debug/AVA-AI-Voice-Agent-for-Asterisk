@@ -12,6 +12,7 @@ import asyncio
 import base64
 import json
 import time
+import uuid
 import audioop
 from ..audio.resampler import resample_audio
 from dataclasses import dataclass
@@ -94,7 +95,7 @@ class _LocalAdapterBase:
         # Log backend info from provider config
         stt_backend = getattr(self._provider_config, 'stt_backend', 'vosk')
         tts_backend = getattr(self._provider_config, 'tts_backend', 'piper')
-        
+
         logger.debug(
             "Local adapter initialized",
             component=self.component_key,
@@ -301,10 +302,10 @@ class _LocalAdapterBase:
     ) -> None:
         """Send JSON payload with automatic reconnection on failure."""
         last_error: Optional[Exception] = None
-        
+
         for attempt in range(1, max_attempts + 1):
             session = self._sessions.get(call_id)
-            
+
             # Check if session exists and is open
             if not session or session.websocket.state.name != "OPEN":
                 logger.debug(
@@ -329,7 +330,7 @@ class _LocalAdapterBase:
                         delay = _RECONNECT_DELAY_BASE_SEC * (2 ** (attempt - 1))
                         await asyncio.sleep(delay)
                     continue
-            
+
             try:
                 await self._send_json(session, payload)
                 return  # Success
@@ -359,7 +360,7 @@ class _LocalAdapterBase:
                 if attempt < max_attempts:
                     delay = _RECONNECT_DELAY_BASE_SEC * (2 ** (attempt - 1))
                     await asyncio.sleep(delay)
-        
+
         # All attempts exhausted
         logger.error(
             "All send attempts failed after reconnection retries",
@@ -381,7 +382,7 @@ class _LocalAdapterBase:
         # Get or create lock for this call_id
         if call_id not in self._reconnect_locks:
             self._reconnect_locks[call_id] = asyncio.Lock()
-        
+
         async with self._reconnect_locks[call_id]:
             # Check again under lock - another task may have reconnected
             existing = self._sessions.get(call_id)
@@ -392,7 +393,7 @@ class _LocalAdapterBase:
                     call_id=call_id,
                 )
                 return existing
-            
+
             # Clean up stale session
             if existing:
                 self._sessions.pop(call_id, None)
@@ -400,20 +401,20 @@ class _LocalAdapterBase:
                     await existing.websocket.close()
                 except Exception:
                     pass
-            
+
             logger.info(
                 "Reconnecting local adapter session",
                 component=self.component_key,
                 call_id=call_id,
             )
-            
+
             # Reopen the session
             await self.open_call(call_id, options)
-            
+
             session = self._sessions.get(call_id)
             if not session or session.websocket.state.name != "OPEN":
                 raise RuntimeError(f"Failed to reconnect session for call {call_id}")
-            
+
             logger.info(
                 "Local adapter session reconnected successfully",
                 component=self.component_key,
@@ -584,7 +585,7 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
                 call_id=call_id,
             )
             return
-        
+
         logger.debug(
             "🎤 STT send_audio called",
             component=self.component_key,
@@ -592,7 +593,7 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
             input_bytes=len(audio),
             format=fmt,
         )
-        
+
         session = self._sessions.get(call_id)
         if not session or session.send_lock is None:
             # Try to recover by checking if we can get a valid session
@@ -602,7 +603,7 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
                 call_id=call_id,
             )
             return  # Skip this audio frame rather than crash the call
-        
+
         pcm16 = self._to_pcm16_16k(audio, fmt, call_id=call_id)
         if not pcm16:
             logger.warning(
@@ -612,22 +613,26 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
                 input_bytes=len(audio),
             )
             return
-        
+
         # Chunk-correlated RMS at engine egress (int16 scale, width=2)
         try:
             egress_rms = audioop.rms(pcm16, 2)
         except (audioop.error, ValueError, TypeError):
             egress_rms = -1
-        
-        logger.debug(
-            "🎤 STT audio converted and sending to server",
-            component=self.component_key,
-            call_id=call_id,
-            pcm16_bytes=len(pcm16),
-            egress_rms_int16=egress_rms,
-            base64_size=len(base64.b64encode(pcm16).decode("ascii")),
-        )
-        
+
+        stt_send_count = int(getattr(session, "stt_send_count", 0) or 0) + 1
+        setattr(session, "stt_send_count", stt_send_count)
+        if egress_rms > 80 or stt_send_count % 25 == 1:
+            logger.debug(
+                "STT audio frame sent to local-ai-server",
+                component=self.component_key,
+                call_id=call_id,
+                frame_index=stt_send_count,
+                pcm16_bytes=len(pcm16),
+                egress_rms_int16=egress_rms,
+            )
+
+
         payload = {
             "type": "audio",
             "mode": "stt",
@@ -636,7 +641,7 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
             "format": "pcm16le",
             "data": base64.b64encode(pcm16).decode("ascii"),
         }
-        
+
         try:
             async with session.send_lock:
                 # Check connection state before sending
@@ -669,7 +674,7 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
                 error=str(exc),
             )
             return  # Don't crash the call
-        
+
         logger.debug(
             "🎤 STT audio sent to local-ai-server",
             component=self.component_key,
@@ -887,7 +892,7 @@ class LocalLLMAdapter(_LocalAdapterBase, LLMComponent):
         options: Dict[str, Any],
     ) -> LLMResponse:
         runtime_options = options or {}
-        
+
         try:
             session = await self._ensure_session(call_id, runtime_options)
         except Exception as exc:
@@ -925,7 +930,7 @@ class LocalLLMAdapter(_LocalAdapterBase, LLMComponent):
                 error=str(exc),
             )
             return LLMResponse(text="")  # Return empty response rather than crash
-        
+
         # Re-fetch session after potential reconnection
         session = self._sessions.get(call_id)
         if not session:
@@ -961,7 +966,7 @@ class LocalLLMAdapter(_LocalAdapterBase, LLMComponent):
                         timeout_sec=timeout,
                     )
                     return LLMResponse(text="")
-                    
+
                 if kind != "json":
                     continue
                 if message.get("type") != "llm_response":
@@ -1110,6 +1115,7 @@ class LocalTTSAdapter(_LocalAdapterBase, TTSComponent):
             options,
             default_mode="tts",
         )
+        self._synthesize_locks: Dict[str, asyncio.Lock] = {}
 
     async def synthesize(
         self,
@@ -1120,135 +1126,187 @@ class LocalTTSAdapter(_LocalAdapterBase, TTSComponent):
         if not text:
             return  # Exit early - yields nothing (async generator)
             yield  # Unreachable but makes this an async generator
+
+        lock = self._synthesize_locks.setdefault(call_id, asyncio.Lock())
+        async with lock:
+            async for chunk in self._synthesize_locked(call_id, text, options):
+                yield chunk
+
+    async def _synthesize_locked(
+        self,
+        call_id: str,
+        text: str,
+        options: Dict[str, Any],
+    ) -> AsyncIterator[bytes]:
         runtime_options = options or {}
-        
-        # Use retry-aware session acquisition
-        try:
-            session = await self._ensure_session(call_id, runtime_options)
-        except Exception as exc:
-            logger.error(
-                "Failed to establish TTS session",
-                component=self.component_key,
-                call_id=call_id,
-                error=str(exc),
-            )
-            return
-            yield  # Unreachable but makes this an async generator
-
-        merged = self._compose_options(runtime_options)
-        logger.debug(
-            "Sending TTS request",
-            component=self.component_key,
-            call_id=call_id,
-            text_preview=(text or "")[:80],
-        )
-        payload = {
-            "type": "tts_request",
-            "call_id": call_id,
-            "mode": "tts",
-            "text": text,
-        }
-        voice = _normalize_voice(merged.get("default_voice") or merged.get("voice"))
-        if voice:
-            payload["voice"] = voice
-
-        # Use retry logic for TTS send
-        try:
-            await self._send_json_with_retry(call_id, payload, runtime_options)
-        except Exception as exc:
-            logger.error(
-                "Failed to send TTS request after retries",
-                component=self.component_key,
-                call_id=call_id,
-                error=str(exc),
-            )
-            return
-            yield  # Unreachable but makes this an async generator
-        
-        # Re-fetch session after potential reconnection
-        session = self._sessions.get(call_id)
-        if not session:
-            logger.error(
-                "TTS session lost after send",
-                component=self.component_key,
-                call_id=call_id,
-            )
-            return
-            yield  # Unreachable
-
-        timeout = float(merged.get("response_timeout_sec", 8.0))
-        started_at = time.perf_counter()
         yielded_audio = False
 
         try:
-            while True:
-                try:
-                    kind, message = await self._recv_any(session, timeout)
-                except (ConnectionClosed, ConnectionClosedError) as exc:
-                    logger.warning(
-                        "TTS connection closed while waiting for response",
-                        component=self.component_key,
-                        call_id=call_id,
-                        error=str(exc),
-                    )
-                    # Remove stale session
-                    self._sessions.pop(call_id, None)
-                    break
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "TTS response timed out",
-                        component=self.component_key,
-                        call_id=call_id,
-                        timeout_sec=timeout,
-                    )
-                    break
-                    
-                if kind == "json":
-                    msg_type = message.get("type")
-                    if msg_type == "tts_response" and message.get("audio_data"):
-                        decoded = base64.b64decode(message["audio_data"])
+            # Use a fresh TTS websocket per request. The local voice server streams
+            # binary frames, and keeping the socket open across responses can leave
+            # a previous receive loop racing with the next synthesis request.
+            await self.close_call(call_id)
+
+            # Use retry-aware session acquisition
+            try:
+                session = await self._ensure_session(call_id, runtime_options)
+            except Exception as exc:
+                logger.error(
+                    "Failed to establish TTS session",
+                    component=self.component_key,
+                    call_id=call_id,
+                    error=str(exc),
+                )
+                return
+                yield  # Unreachable but makes this an async generator
+
+            merged = self._compose_options(runtime_options)
+            logger.info(
+                "Local TTS request sending",
+                component=self.component_key,
+                call_id=call_id,
+                text_preview=(text or "")[:80],
+                text_length=len(text or ""),
+            )
+            payload = {
+                "type": "tts_request",
+                "call_id": call_id,
+                "mode": "tts",
+                "text": text,
+                "request_id": uuid.uuid4().hex,
+                "response_format": "binary",
+            }
+            voice = _normalize_voice(merged.get("default_voice") or merged.get("voice"))
+            if voice:
+                payload["voice"] = voice
+
+            # Use retry logic for TTS send
+            try:
+                await self._send_json_with_retry(call_id, payload, runtime_options)
+            except Exception as exc:
+                logger.error(
+                    "Failed to send TTS request after retries",
+                    component=self.component_key,
+                    call_id=call_id,
+                    error=str(exc),
+                )
+                return
+                yield  # Unreachable but makes this an async generator
+
+            # Re-fetch session after potential reconnection
+            session = self._sessions.get(call_id)
+            if not session:
+                logger.error(
+                    "TTS session lost after send",
+                    component=self.component_key,
+                    call_id=call_id,
+                )
+                return
+                yield  # Unreachable
+
+            timeout = float(merged.get("response_timeout_sec", 8.0))
+            binary_idle_timeout = float(merged.get("binary_idle_timeout_sec", 3.0))
+            started_at = time.perf_counter()
+
+            try:
+                while True:
+                    try:
+                        receive_timeout = binary_idle_timeout if yielded_audio else timeout
+                        kind, message = await self._recv_any(session, receive_timeout)
+                    except (ConnectionClosed, ConnectionClosedError) as exc:
+                        logger.warning(
+                            "TTS connection closed while waiting for response",
+                            component=self.component_key,
+                            call_id=call_id,
+                            error=str(exc),
+                        )
+                        # Remove stale session
+                        self._sessions.pop(call_id, None)
+                        break
+                    except asyncio.TimeoutError:
+                        if yielded_audio:
+                            logger.info(
+                                "Local TTS binary stream idle; treating as complete",
+                                component=self.component_key,
+                                call_id=call_id,
+                                idle_timeout_sec=binary_idle_timeout,
+                            )
+                        else:
+                            logger.warning(
+                                "TTS response timed out",
+                                component=self.component_key,
+                                call_id=call_id,
+                                timeout_sec=timeout,
+                            )
+                        break
+
+                    if kind == "json":
+                        msg_type = message.get("type")
+                        if msg_type == "tts_response" and message.get("audio_data"):
+                            decoded = base64.b64decode(message["audio_data"])
+                            latency_ms = (time.perf_counter() - started_at) * 1000.0
+                            logger.info(
+                                "Local TTS response (base64) received",
+                                component=self.component_key,
+                                call_id=call_id,
+                                latency_ms=round(latency_ms, 2),
+                                bytes=len(decoded),
+                            )
+                            yielded_audio = True
+                            yield decoded
+                            break
+                        if msg_type == "tts_audio":
+                            logger.info(
+                                "Local TTS metadata received",
+                                component=self.component_key,
+                                call_id=call_id,
+                                meta=message,
+                            )
+                            if message.get("is_final_chunk") or message.get("is_final"):
+                                break
+                            continue
+                        if msg_type == "tts_error":
+                            logger.error(
+                                "Local TTS error response received",
+                                component=self.component_key,
+                                call_id=call_id,
+                                error=message.get("error") if isinstance(message, dict) else None,
+                                payload=message,
+                            )
+                            break
+                        logger.info(
+                            "Local TTS ignored JSON message",
+                            component=self.component_key,
+                            call_id=call_id,
+                            message_type=msg_type,
+                            keys=list(message.keys()) if isinstance(message, dict) else [],
+                        )
+                        continue
+
+                    if kind == "binary":
                         latency_ms = (time.perf_counter() - started_at) * 1000.0
                         logger.info(
-                            "Local TTS response (base64) received",
+                            "Local TTS audio chunk received",
                             component=self.component_key,
                             call_id=call_id,
                             latency_ms=round(latency_ms, 2),
-                            bytes=len(decoded),
+                            chunk_bytes=len(message),
                         )
                         yielded_audio = True
-                        yield decoded
-                        break
-                    if msg_type == "tts_audio":
-                        logger.debug(
-                            "Local TTS metadata received",
-                            component=self.component_key,
-                            call_id=call_id,
-                            meta=message,
-                        )
+                        yield message
+                        # Voice-library TTS streams multiple binary frames and ends with
+                        # a tts_audio metadata frame where is_final_chunk=true.
                         continue
-                    continue
-
-                if kind == "binary":
-                    latency_ms = (time.perf_counter() - started_at) * 1000.0
-                    logger.info(
-                        "Local TTS audio chunk received",
-                        component=self.component_key,
-                        call_id=call_id,
-                        latency_ms=round(latency_ms, 2),
-                        chunk_bytes=len(message),
-                    )
-                    yielded_audio = True
-                    yield message
-                    # Assume the local server sends a single binary payload per request.
-                    break
-        except Exception as exc:
-            logger.error(
-                "TTS receive loop failed unexpectedly",
-                component=self.component_key,
-                call_id=call_id,
-                error=str(exc),
-                exc_info=True,
-            )
+            except Exception as exc:
+                logger.error(
+                    "TTS receive loop failed unexpectedly",
+                    component=self.component_key,
+                    call_id=call_id,
+                    error=str(exc),
+                    exc_info=True,
+                )
+        finally:
+            await self.close_call(call_id)
 
         if not yielded_audio:
             logger.warning(
@@ -1256,6 +1314,7 @@ class LocalTTSAdapter(_LocalAdapterBase, TTSComponent):
                 component=self.component_key,
                 call_id=call_id,
             )
+
 
 
 __all__ = [
