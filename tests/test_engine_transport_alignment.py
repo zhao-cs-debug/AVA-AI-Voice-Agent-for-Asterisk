@@ -87,3 +87,21 @@ def test_resolve_stream_targets_pass_through_when_aligned():
     assert remediation is None
     assert session.codec_alignment_ok is True
     _CODEC_ALIGNMENT.remove("openai_realtime")
+
+
+@pytest.mark.parametrize(
+    "reported,expected_format,expected_rate",
+    [
+        ("(alaw)", "alaw", 8000),
+        ("alaw", "alaw", 8000),
+        ("pcma", "alaw", 8000),
+        ("g711_alaw", "alaw", 8000),
+        ("g711-alaw", "alaw", 8000),
+    ],
+)
+def test_normalize_audio_format_preserves_alaw(reported, expected_format, expected_rate):
+    canonical_format, sample_rate, original = Engine._normalize_audio_format(reported)
+
+    assert canonical_format == expected_format
+    assert sample_rate == expected_rate
+    assert original == reported

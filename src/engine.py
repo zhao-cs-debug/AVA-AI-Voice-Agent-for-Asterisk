@@ -13015,17 +13015,23 @@ class Engine:
     def _normalize_audio_format(raw_format: Optional[str]) -> Tuple[str, int, str]:
         """Map assorted codec tokens to canonical AudioSocket format + sample rate."""
         reported = (raw_format or "").strip()
-        token = reported.lower()
+        token = reported.lower().strip().strip("()")
+        token = token.replace(" ", "").replace("-", "_")
 
         alias_map = {
             "mulaw": "ulaw",
-            "mu-law": "ulaw",
+            "mu_law": "ulaw",
+            "pcmu": "ulaw",
             "g711_ulaw": "ulaw",
             "g711ulaw": "ulaw",
-            "g711-ula": "ulaw",
+            "g711_ula": "ulaw",
+            "alaw": "alaw",
+            "a_law": "alaw",
+            "pcma": "alaw",
             "g711_alaw": "alaw",
             "g711alaw": "alaw",
             "slin": "slin16",
+            "slin8": "slin16",
             "slin12": "slin16",
             "slin16": "slin16",
             "linear16": "slin16",
@@ -13035,12 +13041,12 @@ class Engine:
 
         canonical = alias_map.get(token, token if token else "ulaw")
 
-        # We only stream μ-law or PCM16 internally; fall back to μ-law for others (e.g. alaw).
-        if canonical not in {"ulaw", "slin16"}:
+        if canonical not in {"ulaw", "alaw", "slin16"}:
             canonical = "ulaw"
 
         sample_map = {
             "ulaw": 8000,
+            "alaw": 8000,
             "slin16": 16000,
         }
         sample_rate = sample_map.get(canonical, 8000)
