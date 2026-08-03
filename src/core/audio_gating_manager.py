@@ -97,6 +97,10 @@ class AudioGatingManager:
             'elevenlabs_agent': {
                 'gating_enabled': False,  # ElevenLabs handles VAD/echo internally
                 'sample_rate': 16000,  # ElevenLabs uses 16kHz PCM16
+            },
+            'external_strategy_agent': {
+                'gating_enabled': False,  # External service owns VAD and interruption
+                'sample_rate': 16000,
             }
         }
         

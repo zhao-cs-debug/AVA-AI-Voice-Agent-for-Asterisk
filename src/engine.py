@@ -64,6 +64,8 @@ from .providers.google_live import GoogleLiveProvider
 from .providers.grok import GrokProvider
 from .providers.elevenlabs_agent import ElevenLabsAgentProvider
 from .providers.elevenlabs_config import ElevenLabsAgentConfig
+from .providers.external_strategy_agent import ExternalStrategyAgentProvider
+from .providers.external_strategy_config import ExternalStrategyAgentConfig
 from .core import SessionStore, PlaybackManager, ConversationCoordinator
 from .core.vad_manager import EnhancedVADManager, VADResult
 from .core.streaming_playback_manager import StreamingPlaybackManager
@@ -632,6 +634,15 @@ class Engine:
             ):
                 return False
         return True
+
+    def _provider_keeps_live_input_during_tts(self, provider_name: Optional[str]) -> bool:
+        """Keep the documented full-duplex input path open for strategy 1.0.
+
+        Other providers retain their existing RTP gating behavior. The external
+        strategy service needs live caller audio while its TTS is playing so it
+        can issue protocol-level probe and interruption events.
+        """
+        return self._get_provider_kind(provider_name) == "external_strategy_agent"
 
     def _fire_and_forget(self, coro, *, name: Optional[str] = None) -> asyncio.Task:
         """Create a fire-and-forget task with exception logging."""
@@ -2431,6 +2442,36 @@ class Engine:
                     self.provider_factories[name] = (
                         lambda cfg=elevenlabs_cfg, key=name, p_kind=kind: self._provider_with_identity(
                             ElevenLabsAgentProvider(self._clone_config(cfg), self.on_provider_event),
+                            key,
+                            p_kind,
+                        )
+                    )
+                    logger.info(
+                        "Provider loaded successfully",
+                        provider=name,
+                        kind=kind,
+                    )
+
+                    runtime_issues = self._describe_provider_alignment(name, provider)
+                    if runtime_issues:
+                        self.provider_alignment_issues.setdefault(name, []).extend(runtime_issues)
+                elif kind == "external_strategy_agent":
+                    external_cfg = self._build_external_strategy_config(provider_config_data, name)
+                    if not external_cfg:
+                        continue
+
+                    provider = ExternalStrategyAgentProvider(
+                        external_cfg,
+                        self.on_provider_event,
+                    )
+                    self._set_provider_identity(provider, name, kind)
+                    self.providers[name] = provider
+                    self.provider_factories[name] = (
+                        lambda cfg=external_cfg, key=name, p_kind=kind: self._provider_with_identity(
+                            ExternalStrategyAgentProvider(
+                                self._clone_config(cfg),
+                                self.on_provider_event,
+                            ),
                             key,
                             p_kind,
                         )
@@ -8518,10 +8559,12 @@ class Engine:
                 # Preserve original inbound audio for local barge-in fallback checks (never run VAD on silence-substituted frames).
                 pcm_for_barge_in = pcm_16k
 
-                # CRITICAL: Check if audio capture is disabled (TTS playing)
+                # Check if audio capture is disabled (TTS playing).
                 # For Google Live: Send silence frames to maintain stream continuity (like AudioSocket)
-                # For OpenAI/Deepgram: Can drop audio (they handle gaps gracefully)
+                # Strategy 1.0 remains full duplex so its remote VAD can own interruption.
+                # Other providers retain the existing local fallback behavior.
                 needs_gating = self._get_provider_kind(provider_name) == "google_live"
+                keeps_live_input = self._provider_keeps_live_input_during_tts(provider_name)
                 
                 if needs_gating and not session.audio_capture_enabled:
                     # Send SILENCE instead of dropping to maintain Google Live's stream
@@ -8532,7 +8575,7 @@ class Engine:
                     )
                     # Replace audio with silence (zero-filled PCM16)
                     pcm_16k = b'\x00' * len(pcm_16k)
-                elif not needs_gating and not session.audio_capture_enabled:
+                elif not needs_gating and not keeps_live_input and not session.audio_capture_enabled:
                     # For other providers, do not forward audio during TTS, but still run
                     # local barge-in detection on the real inbound frames so interruptions work.
                     logger.debug(
@@ -8912,6 +8955,43 @@ class Engine:
             return cfg
         except Exception as exc:
             logger.error("Failed to build ElevenLabsAgentConfig", error=str(exc), exc_info=True)
+            return None
+
+    def _build_external_strategy_config(
+        self,
+        provider_cfg: Dict[str, Any],
+        provider_key: str = "external_strategy_agent",
+    ) -> Optional[ExternalStrategyAgentConfig]:
+        """Construct the external full-duplex strategy provider configuration."""
+        try:
+            merged = _resolve_config_env_vars(dict(provider_cfg))
+            merged["api_key"] = resolve_secret_value(
+                merged,
+                file_field="api_key_file",
+                env_field="api_key_env",
+                inline_field="api_key",
+                legacy_env_names=("STRATEGY_NETWORK_API_KEY",),
+            )
+            cfg = ExternalStrategyAgentConfig.from_dict(merged)
+            if not cfg.enabled:
+                logger.info(
+                    "External strategy provider disabled in configuration; skipping initialization.",
+                    provider=provider_key,
+                )
+                return None
+            if not cfg.api_key:
+                logger.info(
+                    "External strategy provider has no API key; using protocol no-auth mode",
+                    provider=provider_key,
+                )
+            return cfg
+        except Exception as exc:
+            logger.error(
+                "Failed to build ExternalStrategyAgentConfig",
+                error=str(exc),
+                exc_info=True,
+                provider=provider_key,
+            )
             return None
 
     def _audit_provider_config(self, name: str, provider_cfg: Dict[str, Any]) -> List[str]:
@@ -9354,7 +9434,7 @@ class Engine:
             if etype == "AgentAudio":
                 chunk: bytes = event.get("data") or b""
                 if not chunk:
-                    return
+                    return False
                 provider_segment_id = event.get("segment_id") or event.get("turn_id")
                 # If barge-in fired, suppress provider audio locally for a short window so streaming
                 # doesn't immediately restart with the remainder of the previous sentence.
@@ -9388,7 +9468,7 @@ class Engine:
                             )
                             sup["last_log_ts"] = now
                         session.vad_state["output_suppression"] = sup
-                        return
+                        return False
                     if until_ts and now >= until_ts and bool(sup.get("active", False)):
                         sup["active"] = False
                         sup["until_ts"] = 0.0
@@ -9531,23 +9611,27 @@ class Engine:
                         # Best-effort: play this chunk via file playback and return.
                         # NOTE: file playback assumes Asterisk-compatible ulaw; streaming providers may emit PCM.
                         try:
-                            await self.playback_manager.play_audio(
+                            playback_id = await self.playback_manager.play_audio(
                                 call_id,
                                 out_chunk,
                                 "streaming-response",
                             )
+                            return bool(playback_id)
                         except Exception:
                             logger.error(
                                 "File playback failed in downstream_mode=file",
                                 call_id=call_id,
                                 exc_info=True,
                             )
-                        return
+                        return False
                 except Exception:
                     logger.debug("downstream_mode=file guardrail failed", call_id=call_id, exc_info=True)
 
                 # Coalescing settings
+                provider_kind = self._get_provider_kind(getattr(session, "provider_name", None))
                 coalesce_enabled = bool(getattr(getattr(self.config, 'streaming', {}), 'coalesce_enabled', False))
+                if provider_kind == "external_strategy_agent":
+                    coalesce_enabled = False
                 try:
                     coalesce_min_ms = int(getattr(self.config.streaming, 'coalesce_min_ms', 600))
                 except Exception:
@@ -9661,6 +9745,7 @@ class Engine:
                         else:
                             # downstream_mode="file" - use file playback instead of streaming
                             logger.info("Using file playback (downstream_mode=file)", call_id=call_id)
+                            playback_id = None
                             try:
                                 playback_id = await self.playback_manager.play_audio(call_id, bytes(buf), "streaming-response")
                                 logger.info("File playback started (forced by downstream_mode)", 
@@ -9668,7 +9753,7 @@ class Engine:
                             except Exception:
                                 logger.error("File playback failed (downstream_mode=file)", call_id=call_id, exc_info=True)
                             self._provider_coalesce_buf.pop(call_id, None)
-                            return
+                            return bool(playback_id)
                         self._emit_transport_card(
                             call_id,
                             session,
@@ -9768,13 +9853,14 @@ class Engine:
                             logger.error("Failed to start streaming playback", call_id=call_id, exc_info=True)
                             # CRITICAL: Remove orphan queue so subsequent chunks trigger fresh playback
                             self._provider_stream_queues.pop(call_id, None)
+                            playback_id = None
                             try:
                                 playback_id = await self.playback_manager.play_audio(call_id, out_chunk, "streaming-response")
                                 if not playback_id:
                                     logger.error("Fallback file playback failed", call_id=call_id, size=len(out_chunk))
                             except Exception:
                                 logger.error("Fallback file playback exception", call_id=call_id, exc_info=True)
-                            return
+                            return bool(playback_id)
                     try:
                         # Track provider bytes
                         try:
@@ -9828,6 +9914,8 @@ class Engine:
                             self._enqueued_bytes[call_id] = int(self._enqueued_bytes.get(call_id, 0)) + len(out_chunk)
                     except asyncio.QueueFull:
                         logger.debug("Provider streaming queue full; dropping chunk", call_id=call_id)
+                        return False
+                    return True
             elif etype == "AgentAudioDone":
                 provider_segment_id = event.get("segment_id") or event.get("turn_id")
                 monitor_segment_id = self._get_voiceai_segment_id(call_id, "assistant", provider_segment_id)
@@ -10384,6 +10472,8 @@ class Engine:
 
         except Exception as exc:
             logger.error("Error handling provider event", error=str(exc), exc_info=True)
+            if event.get("type") == "AgentAudio":
+                return False
 
     def _get_voiceai_segment_id(self, call_id: str, role: str, preferred_segment_id: Optional[str] = None) -> str:
         if role != "assistant":
@@ -14532,6 +14622,9 @@ class Engine:
                         has_tools_attr=hasattr(context_config, 'tools') if context_config else False,
                     )
                     if context_config:
+                        external_strategy = getattr(context_config, "external_strategy", None)
+                        if isinstance(external_strategy, dict):
+                            provider_context["external_strategy"] = copy.deepcopy(external_strategy)
                         # Register per-context in-call HTTP tools if defined
                         in_call_http_tools_cfg = getattr(context_config, "in_call_http_tools", None)
                         allowed_in_call_http_tool_names: list[str] = []

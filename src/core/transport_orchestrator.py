@@ -48,6 +48,7 @@ class ContextConfig:
     tools: Optional[list] = None  # In-call tool names for function calling
     default_voice: Optional[Dict[str, Any]] = None  # HiFi voice_library selection for TTS
     background_music: Optional[str] = None  # MOH class name for background music during calls
+    external_strategy: Optional[Dict[str, Any]] = None  # Full external strategy-agent call config
     
     # Phase tool configuration (Milestone 24)
     pre_call_tools: Optional[List[str]] = None  # Tool names to run after answer, before AI speaks
@@ -154,6 +155,11 @@ class TransportOrchestrator:
                     tools=context_dict.get('tools'),  # In-call tools for function calling
                     default_voice=context_dict.get('default_voice') if isinstance(context_dict.get('default_voice'), dict) else None,
                     background_music=context_dict.get('background_music'),  # MOH class for background music
+                    external_strategy=(
+                        context_dict.get('external_strategy')
+                        if isinstance(context_dict.get('external_strategy'), dict)
+                        else None
+                    ),
                     # Phase tool configuration (Milestone 24)
                     pre_call_tools=context_dict.get('pre_call_tools'),
                     post_call_tools=context_dict.get('post_call_tools'),
