@@ -26,6 +26,7 @@ from .azure import (
 from .orchestrator import (
     PipelineOrchestrator,
     PipelineOrchestratorError,
+    PipelineUnavailableError,
     PipelineResolution,
 )
 
@@ -45,5 +46,6 @@ __all__ = [
     "AzureTTSAdapter",
     "PipelineOrchestrator",
     "PipelineOrchestratorError",
+    "PipelineUnavailableError",
     "PipelineResolution",
 ]

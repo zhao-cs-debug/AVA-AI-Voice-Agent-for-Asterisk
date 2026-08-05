@@ -1,7 +1,7 @@
 import pytest
 
 from src.config import AppConfig
-from src.pipelines.orchestrator import PipelineOrchestrator
+from src.pipelines.orchestrator import PipelineOrchestrator, PipelineUnavailableError
 
 
 def _build_app_config_with_one_invalid_pipeline() -> AppConfig:
@@ -44,7 +44,35 @@ async def test_orchestrator_skips_invalid_pipelines_and_keeps_valid_ones(monkeyp
     assert orchestrator.started
     assert "google_stack" in orchestrator._invalid_pipelines
 
-    resolution = orchestrator.get_pipeline("call-1", "google_stack")
+    with pytest.raises(PipelineUnavailableError) as error:
+        orchestrator.get_pipeline("call-1", "google_stack")
+
+    assert error.value.pipeline_name == "google_stack"
+    assert "unavailable" in str(error.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_uses_default_only_when_pipeline_is_unspecified(monkeypatch):
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+    orchestrator = PipelineOrchestrator(_build_app_config_with_one_invalid_pipeline())
+    await orchestrator.start()
+
+    resolution = orchestrator.get_pipeline("call-default")
+
     assert resolution is not None
     assert resolution.pipeline_name == "openai_stack"
+
+
+@pytest.mark.asyncio
+async def test_missing_explicit_pipeline_never_falls_back(monkeypatch):
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+    orchestrator = PipelineOrchestrator(_build_app_config_with_one_invalid_pipeline())
+    await orchestrator.start()
+
+    with pytest.raises(PipelineUnavailableError) as error:
+        orchestrator.get_pipeline("call-missing", "does-not-exist")
+
+    assert error.value.pipeline_name == "does-not-exist"
 

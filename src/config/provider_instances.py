@@ -32,6 +32,7 @@ FULL_AGENT_KINDS = frozenset(
         "openai_realtime",
         "google_live",
         "elevenlabs_agent",
+        "external_strategy_agent",
         "grok",
     }
 )
@@ -41,6 +42,7 @@ FULL_AGENT_KINDS_WITH_NATIVE_TTS_GATING = frozenset(
         "deepgram",
         "openai_realtime",
         "elevenlabs_agent",
+        "external_strategy_agent",
         "grok",
     }
 )
@@ -53,6 +55,7 @@ API_KEY_COMPATIBLE_KINDS = frozenset(
         "openai_realtime",
         "google_live",
         "elevenlabs_agent",
+        "external_strategy_agent",
         "grok",
     }
 )

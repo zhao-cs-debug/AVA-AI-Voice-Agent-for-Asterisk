@@ -770,10 +770,13 @@ class BargeInConfig(BaseModel):
     # Minimum TTS elapsed time (ms) before TalkDetect barge-in is honoured.
     # Higher than initial_protection_ms to reject phone-echo triggering TALK_DETECT.
     talk_detect_initial_protection_ms: int = Field(default=1500)
+    # Pipeline TalkDetect is only a candidate interruption until STT confirms
+    # customer speech. Resume the paused answer when no transcript arrives.
+    talk_detect_transcript_confirmation_timeout_ms: int = Field(default=1200)
     # New: short guard window after TTS ends to avoid self-echo re-capture
     post_tts_end_protection_ms: int = Field(default=250)
-    # Extra protection during the first greeting turn
-    greeting_protection_ms: int = Field(default=0)
+    # Keep the opening audible before allowing transcript-confirmed barge-in.
+    greeting_protection_ms: int = Field(default=3000)
     # Provider-owned mode: local VAD fallback only for providers that don't emit explicit interruption events.
     provider_fallback_enabled: bool = Field(default=True)
     provider_fallback_providers: List[str] = Field(default_factory=lambda: ["google_live", "deepgram"])

@@ -1,7 +1,8 @@
 import os
+import re
 import wave
 import threading
-from typing import Dict, Tuple, Optional
+from typing import Dict, FrozenSet, Mapping, Optional, Tuple
 
 import audioop
 
@@ -23,6 +24,7 @@ class AudioCaptureManager:
                 pass
         except Exception:
             pass
+
 
     def _open_handle(self, call_id: str, stream_name: str, sample_rate: int) -> wave.Wave_write:
         path = os.path.join(self.base_dir, call_id, f"{stream_name}.wav")
@@ -143,3 +145,76 @@ class AudioCaptureManager:
         except Exception:
             pass
 
+
+class CustomerAudioCaptureManager:
+    """Opt-in capture of caller-side PCM for repeatable development tests."""
+
+    DEFAULT_BASE_DIR = "/tmp/ai-engine-customer-captures"
+
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        caller_allowlist,
+        base_dir: str = DEFAULT_BASE_DIR,
+    ):
+        normalized_callers = {
+            str(value or "").strip()
+            for value in (caller_allowlist or set())
+            if str(value or "").strip()
+        }
+        # Capturing without an explicit allowlist is intentionally forbidden.
+        self.enabled = bool(enabled and normalized_callers)
+        self.caller_allowlist: FrozenSet[str] = frozenset(normalized_callers)
+        self.base_dir = str(base_dir or self.DEFAULT_BASE_DIR)
+        self._capture = (
+            AudioCaptureManager(base_dir=self.base_dir, keep_files=True)
+            if self.enabled
+            else None
+        )
+
+    @classmethod
+    def from_environment(
+        cls,
+        environment: Optional[Mapping[str, str]] = None,
+    ) -> "CustomerAudioCaptureManager":
+        env = environment if environment is not None else os.environ
+        enabled = str(env.get("VOICEAI_CUSTOMER_CAPTURE_ENABLED", "false")).strip().lower()
+        raw_callers = str(env.get("VOICEAI_CUSTOMER_CAPTURE_CALLERS", ""))
+        callers = {
+            value.strip()
+            for value in re.split(r"[,;\s]+", raw_callers)
+            if value.strip()
+        }
+        return cls(
+            enabled=enabled in {"1", "true", "yes", "on"},
+            caller_allowlist=callers,
+            base_dir=str(
+                env.get("VOICEAI_CUSTOMER_CAPTURE_DIR", cls.DEFAULT_BASE_DIR)
+                or cls.DEFAULT_BASE_DIR
+            ),
+        )
+
+    def append_pcm16(
+        self,
+        *,
+        call_id: str,
+        caller_number: Optional[str],
+        called_number: Optional[str],
+        pcm16: bytes,
+        sample_rate: int,
+    ) -> bool:
+        if not self.enabled or self._capture is None or not pcm16:
+            return False
+        identifiers = {
+            str(caller_number or "").strip(),
+            str(called_number or "").strip(),
+        }
+        if not self.caller_allowlist.intersection(identifiers):
+            return False
+        self._capture.append_pcm16(call_id, "customer", pcm16, sample_rate)
+        return True
+
+    def close_call(self, call_id: str) -> None:
+        if self._capture is not None:
+            self._capture.close_call(call_id)

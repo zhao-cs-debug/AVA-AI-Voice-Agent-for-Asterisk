@@ -33,6 +33,16 @@ from .base import LLMComponent, LLMResponse, STTComponent, TTSComponent
 logger = get_logger(__name__)
 
 _DEFAULT_WS_URL = "ws://127.0.0.1:8765"
+_STT_EVENT_METADATA_FIELDS = (
+    "event_id",
+    "item_id",
+    "audio_start_ms",
+    "audio_end_ms",
+    "audio_duration_ms",
+    "received_at_ms",
+    "raw_event_type",
+    "source_activity",
+)
 
 
 def _merge_dicts(base: Dict[str, Any], override: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -65,6 +75,7 @@ class _LocalSessionState:
     call_id: str
     handshake_complete: bool = False
     result_queue: Optional[asyncio.Queue] = None
+    event_queue: Optional[asyncio.Queue] = None
     receiver_task: Optional[asyncio.Task] = None
     send_lock: Optional[asyncio.Lock] = None
 
@@ -560,6 +571,9 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
         if session.result_queue is None:
             maxsize = int(runtime_options.get("stream_queue_maxsize", 16))
             session.result_queue = asyncio.Queue(max(maxsize, 1))
+        if session.event_queue is None:
+            maxsize = int(runtime_options.get("stream_queue_maxsize", 16))
+            session.event_queue = asyncio.Queue(max(maxsize, 1))
         if session.receiver_task and not session.receiver_task.done():
             return
         session.receiver_task = asyncio.create_task(
@@ -694,6 +708,38 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
                 break
             yield result
 
+    async def iter_events(self, call_id: str) -> AsyncIterator[Dict[str, Any]]:
+        """Yield streaming STT activity while keeping partials internal."""
+        session = self._sessions.get(call_id)
+        if not session or session.event_queue is None:
+            raise RuntimeError(
+                f"Streaming session not started for call {call_id}; call start_stream first"
+            )
+        while True:
+            event = await session.event_queue.get()
+            if event is None:
+                break
+            yield event
+
+    @staticmethod
+    def _offer_stream_item(queue: Optional[asyncio.Queue], item: Any) -> None:
+        """Offer the newest event without letting an unused compatibility queue block STT."""
+        if queue is None:
+            return
+        try:
+            queue.put_nowait(item)
+            return
+        except asyncio.QueueFull:
+            pass
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+        try:
+            queue.put_nowait(item)
+        except asyncio.QueueFull:
+            pass
+
     async def stop_stream(self, call_id: str) -> None:
         session = self._sessions.get(call_id)
         if not session:
@@ -712,12 +758,12 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
                     exc_info=True,
                 )
         if session.result_queue:
-            try:
-                session.result_queue.put_nowait(None)
-            except asyncio.QueueFull:
-                pass
+            self._offer_stream_item(session.result_queue, None)
+        if session.event_queue:
+            self._offer_stream_item(session.event_queue, None)
         session.receiver_task = None
         session.result_queue = None
+        session.event_queue = None
         session.send_lock = None
 
     async def close_call(self, call_id: str) -> None:
@@ -730,8 +776,9 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
         session: _LocalSessionState,
         options: Dict[str, Any],
     ) -> None:
-        queue = session.result_queue
-        if queue is None:
+        result_queue = session.result_queue
+        event_queue = session.event_queue
+        if result_queue is None or event_queue is None:
             return
         timeout = options.get("streaming_result_timeout_sec")
         timeout_val = float(timeout) if timeout is not None else None
@@ -745,19 +792,29 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
                     continue
                 if message.get("type") != "stt_result":
                     continue
-                if message.get("is_partial", False):
+                is_partial = bool(message.get("is_partial", False))
+                is_final = bool(message.get("is_final", not is_partial))
+                text = str(message.get("text") or "")
+                event = {
+                    "text": text,
+                    "is_partial": is_partial,
+                    "is_final": is_final,
+                }
+                for field in _STT_EVENT_METADATA_FIELDS:
+                    value = message.get(field)
+                    if value is not None:
+                        event[field] = value
+                self._offer_stream_item(event_queue, event)
+                if is_partial:
                     logger.debug(
                         "Local STT partial received",
                         component=self.component_key,
                         call_id=session.call_id,
-                        transcript_preview=(message.get("text") or "")[:80],
+                        transcript_preview=text[:80],
                     )
                     continue
-                text = (message.get("text") or "")
-                try:
-                    queue.put_nowait(text)
-                except asyncio.QueueFull:
-                    await queue.put(text)
+                if is_final:
+                    self._offer_stream_item(result_queue, text)
         except asyncio.CancelledError:
             pass
         except ConnectionClosed:
@@ -770,10 +827,8 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
                 exc_info=True,
             )
         finally:
-            try:
-                queue.put_nowait(None)
-            except asyncio.QueueFull:
-                pass
+            self._offer_stream_item(result_queue, None)
+            self._offer_stream_item(event_queue, None)
 
     def _to_pcm16_16k(self, audio: bytes, fmt: str, call_id: str = "") -> bytes:
         if not audio:

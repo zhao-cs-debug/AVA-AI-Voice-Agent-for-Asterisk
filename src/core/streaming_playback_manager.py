@@ -587,17 +587,27 @@ class StreamingPlaybackManager:
             provider_kind = getattr(session, 'provider_kind', None) if session else None
             provider_kind = provider_kind or provider_name
             skip_gating = provider_kind in FULL_AGENT_KINDS_WITH_NATIVE_TTS_GATING
-            
+            defer_gating = playback_type == "pipeline-tts" and not skip_gating
+
             gating_success = True
+            gating_started = False
             if skip_gating:
                 logger.debug("Skipping TTS gating for full agent provider",
                            call_id=call_id,
                            provider=provider_name,
                            stream_id=stream_id)
+            elif defer_gating:
+                logger.debug(
+                    "Deferring pipeline TTS gating until first real audio frame",
+                    call_id=call_id,
+                    stream_id=stream_id,
+                )
             elif self.conversation_coordinator:
                 gating_success = await self.conversation_coordinator.on_tts_start(call_id, stream_id)
+                gating_started = bool(gating_success)
             else:
                 gating_success = await self.session_store.set_gating_token(call_id, stream_id)
+                gating_started = bool(gating_success)
 
             if not gating_success:
                 logger.error("Failed to start streaming gating",
@@ -704,6 +714,7 @@ class StreamingPlaybackManager:
                 'pacer_task': None,
                 'keepalive_task': None,
                 'stop_event': asyncio.Event(),
+                'playback_resume_event': asyncio.Event(),
                 'start_time': time.time(),
                 'seg_start_ts': time.time(),
                 'chunks_sent': 0,
@@ -739,7 +750,12 @@ class StreamingPlaybackManager:
                 'idle_cutoff_ticks': idle_cutoff_ticks,
                 'last_real_emit_ts': None,
                 'last_emit_was_filler': False,
+                'gating_started': gating_started,
+                'gating_deferred': defer_gating,
+                'skip_gating': skip_gating,
+                'gating_lock': asyncio.Lock(),
             }
+            self.active_streams[call_id]['playback_resume_event'].set()
             self._startup_ready[call_id] = bool(initial_startup_ready)
 
             # Register the stream before starting background tasks. The pacer
@@ -1044,6 +1060,16 @@ class StreamingPlaybackManager:
         next_tick = time.perf_counter()
         try:
             while True:
+                stream_info = self.active_streams.get(call_id)
+                if not stream_info:
+                    break
+                resume_event = stream_info.get('playback_resume_event')
+                if isinstance(resume_event, asyncio.Event) and not resume_event.is_set():
+                    await resume_event.wait()
+                    next_tick = time.perf_counter()
+                    if call_id not in self.active_streams:
+                        break
+                    continue
                 now = time.perf_counter()
                 sleep_for = next_tick - now
                 if sleep_for > 0:
@@ -1351,6 +1377,46 @@ class StreamingPlaybackManager:
         stream_info.pop('low_water_deadline', None)
         return False
 
+    async def _ensure_deferred_gating_started(self, call_id: str, stream_id: str) -> bool:
+        info = self.active_streams.get(call_id)
+        if not info or str(info.get("stream_id") or "") != str(stream_id):
+            return False
+        if info.get("skip_gating") or not info.get("gating_deferred"):
+            return True
+        if info.get("gating_started"):
+            return True
+
+        gating_lock = info.get("gating_lock")
+        if not isinstance(gating_lock, asyncio.Lock):
+            gating_lock = asyncio.Lock()
+            info["gating_lock"] = gating_lock
+
+        async with gating_lock:
+            current = self.active_streams.get(call_id)
+            if not current or str(current.get("stream_id") or "") != str(stream_id):
+                return False
+            if current.get("gating_started"):
+                return True
+            if self.conversation_coordinator:
+                started = await self.conversation_coordinator.on_tts_start(call_id, stream_id)
+            else:
+                started = await self.session_store.set_gating_token(call_id, stream_id)
+            if not started:
+                current["end_reason"] = current.get("end_reason") or "gating-start-failed"
+                logger.error(
+                    "Failed to start deferred pipeline TTS gating",
+                    call_id=call_id,
+                    stream_id=stream_id,
+                )
+                return False
+            current["gating_started"] = True
+            logger.debug(
+                "Deferred pipeline TTS gating started",
+                call_id=call_id,
+                stream_id=stream_id,
+            )
+            return True
+
     async def _emit_frame(
         self,
         call_id: str,
@@ -1361,6 +1427,8 @@ class StreamingPlaybackManager:
         *,
         filler: bool,
     ) -> str:
+        if not filler and not await self._ensure_deferred_gating_started(call_id, stream_id):
+            return "error"
         success = await self._send_audio_chunk(
             call_id,
             stream_id,
@@ -3330,6 +3398,9 @@ class StreamingPlaybackManager:
             stop_event = stream_info.get('stop_event')
             if isinstance(stop_event, asyncio.Event):
                 stop_event.set()
+            resume_event = stream_info.get('playback_resume_event')
+            if isinstance(resume_event, asyncio.Event):
+                resume_event.set()
 
             def _cancel_task(task: Any) -> None:
                 if not task or not hasattr(task, "cancel"):
@@ -3723,16 +3794,18 @@ class StreamingPlaybackManager:
             except Exception:
                 logger.debug("Remainder flush failed", call_id=call_id, stream_id=stream_id)
 
-            # Clear TTS gating after flushing
-            if self.conversation_coordinator:
-                await self.conversation_coordinator.on_tts_end(
-                    call_id, stream_id, "streaming-ended"
-                )
-                await self.conversation_coordinator.update_conversation_state(
-                    call_id, "listening"
-                )
-            else:
-                await self.session_store.clear_gating_token(call_id, stream_id)
+            # Clear TTS gating only when this stream actually established it.
+            stream_info = self.active_streams.get(call_id, {}) or {}
+            if bool(stream_info.get("gating_started", False)):
+                if self.conversation_coordinator:
+                    await self.conversation_coordinator.on_tts_end(
+                        call_id, stream_id, "streaming-ended"
+                    )
+                    await self.conversation_coordinator.update_conversation_state(
+                        call_id, "listening"
+                    )
+                else:
+                    await self.session_store.clear_gating_token(call_id, stream_id)
             
             # Observe segment duration and end reason
             try:
@@ -3854,6 +3927,56 @@ class StreamingPlaybackManager:
             return False
         task = info.get('streaming_task')
         return task is not None and not task.done()
+
+    async def pause_streaming_playback(
+        self,
+        call_id: str,
+        *,
+        stream_id: Optional[str] = None,
+    ) -> bool:
+        """Pause transport emission while preserving the producer and queued audio."""
+        info = self.active_streams.get(call_id)
+        if not info or (stream_id is not None and info.get('stream_id') != stream_id):
+            return False
+        resume_event = info.get('playback_resume_event')
+        if not isinstance(resume_event, asyncio.Event):
+            resume_event = asyncio.Event()
+            resume_event.set()
+            info['playback_resume_event'] = resume_event
+        if not resume_event.is_set():
+            return True
+        resume_event.clear()
+        info['paused_at'] = time.time()
+        logger.info(
+            "Streaming playback paused",
+            call_id=call_id,
+            stream_id=info.get('stream_id'),
+        )
+        return True
+
+    async def resume_streaming_playback(
+        self,
+        call_id: str,
+        *,
+        stream_id: Optional[str] = None,
+    ) -> bool:
+        """Resume a paused stream without replacing its producer or queue."""
+        info = self.active_streams.get(call_id)
+        if not info or (stream_id is not None and info.get('stream_id') != stream_id):
+            return False
+        resume_event = info.get('playback_resume_event')
+        if not isinstance(resume_event, asyncio.Event):
+            resume_event = asyncio.Event()
+            info['playback_resume_event'] = resume_event
+        resume_event.set()
+        paused_at = float(info.pop('paused_at', 0.0) or 0.0)
+        logger.info(
+            "Streaming playback resumed",
+            call_id=call_id,
+            stream_id=info.get('stream_id'),
+            paused_ms=int(max(0.0, time.time() - paused_at) * 1000) if paused_at else 0,
+        )
+        return True
 
     async def get_active_streams(self) -> Dict[str, Dict[str, Any]]:
         """Get information about active streams."""

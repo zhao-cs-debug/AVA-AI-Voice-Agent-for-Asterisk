@@ -1,0 +1,6 @@
+services:
+  ai_engine:
+    environment:
+      VOICEAI_CUSTOMER_CAPTURE_ENABLED: "true"
+      VOICEAI_CUSTOMER_CAPTURE_CALLERS: "701"
+      VOICEAI_CUSTOMER_CAPTURE_DIR: "/tmp/ai-engine-customer-captures"

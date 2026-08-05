@@ -98,12 +98,24 @@ async def test_local_stt_adapter_transcribes(monkeypatch):
         "text": "hello",
         "is_partial": True,
         "is_final": False,
+        "event_id": "evt-partial",
+        "item_id": "item-1",
+        "audio_start_ms": 0,
+        "audio_end_ms": 160,
+        "audio_duration_ms": 160,
+        "received_at_ms": 160,
     }
     final_payload = {
         "type": "stt_result",
         "text": "hello world",
         "is_partial": False,
         "is_final": True,
+        "event_id": "evt-final",
+        "item_id": "item-1",
+        "audio_start_ms": 0,
+        "audio_end_ms": 320,
+        "audio_duration_ms": 320,
+        "received_at_ms": 320,
     }
 
     mock_ws.push(json.dumps(partial_payload))
@@ -118,6 +130,94 @@ async def test_local_stt_adapter_transcribes(monkeypatch):
     assert audio_message["mode"] == "stt"
     decoded = base64.b64decode(audio_message["data"])
     assert decoded == audio_buffer
+
+
+@pytest.mark.asyncio
+async def test_local_stt_stream_exposes_partial_activity_and_keeps_final_results(monkeypatch):
+    app_config = _build_app_config()
+    provider_config = LocalProviderConfig(**app_config.providers["local"])
+    adapter = LocalSTTAdapter("local_stt", app_config, provider_config, {"mode": "stt"})
+    mock_ws = _MockWebSocket()
+
+    async def fake_connect(*_args, **_kwargs):
+        mock_ws.push(json.dumps({"type": "mode_ready", "mode": "stt", "call_id": "call-stream"}))
+        return mock_ws
+
+    monkeypatch.setattr("src.pipelines.local.websockets.connect", fake_connect)
+
+    await adapter.start()
+    await adapter.open_call("call-stream", {"mode": "stt"})
+    await adapter.start_stream("call-stream", {"mode": "stt"})
+
+    events = []
+    finals = []
+
+    async def collect_events():
+        async for event in adapter.iter_events("call-stream"):
+            events.append(event)
+            if len(events) == 2:
+                break
+
+    async def collect_finals():
+        async for text in adapter.iter_results("call-stream"):
+            finals.append(text)
+            break
+
+    event_task = asyncio.create_task(collect_events())
+    final_task = asyncio.create_task(collect_finals())
+    mock_ws.push(json.dumps({
+        "type": "stt_result",
+        "text": "是什么",
+        "is_partial": True,
+        "is_final": False,
+        "event_id": "evt-partial",
+        "item_id": "item-1",
+        "audio_start_ms": 0,
+        "audio_end_ms": 160,
+        "audio_duration_ms": 160,
+        "received_at_ms": 160,
+    }))
+    mock_ws.push(json.dumps({
+        "type": "stt_result",
+        "text": "是什么事？",
+        "is_partial": False,
+        "is_final": True,
+        "event_id": "evt-final",
+        "item_id": "item-1",
+        "audio_start_ms": 0,
+        "audio_end_ms": 480,
+        "audio_duration_ms": 480,
+        "received_at_ms": 480,
+    }))
+
+    await asyncio.wait_for(asyncio.gather(event_task, final_task), timeout=1.0)
+
+    assert events == [
+        {
+            "text": "是什么",
+            "is_partial": True,
+            "is_final": False,
+            "event_id": "evt-partial",
+            "item_id": "item-1",
+            "audio_start_ms": 0,
+            "audio_end_ms": 160,
+            "audio_duration_ms": 160,
+            "received_at_ms": 160,
+        },
+        {
+            "text": "是什么事？",
+            "is_partial": False,
+            "is_final": True,
+            "event_id": "evt-final",
+            "item_id": "item-1",
+            "audio_start_ms": 0,
+            "audio_end_ms": 480,
+            "audio_duration_ms": 480,
+            "received_at_ms": 480,
+        },
+    ]
+    assert finals == ["是什么事？"]
+    await adapter.stop_stream("call-stream")
 
 
 @pytest.mark.asyncio
@@ -167,6 +267,8 @@ async def test_local_tts_adapter_synthesizes(monkeypatch):
     mock_ws = _MockWebSocket()
 
     async def fake_connect(*_args, **_kwargs):
+        mock_ws.closed = False
+        mock_ws.push(json.dumps({"type": "mode_ready", "mode": "tts", "call_id": "call-3"}))
         return mock_ws
 
     monkeypatch.setattr("src.pipelines.local.websockets.connect", fake_connect)
@@ -184,7 +286,11 @@ async def test_local_tts_adapter_synthesizes(monkeypatch):
             collected.append(chunk)
 
     task = asyncio.create_task(collect_audio())
-    await asyncio.sleep(0)
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if any(json.loads(message).get("type") == "tts_request" for message in mock_ws.sent):
+            break
+    assert any(json.loads(message).get("type") == "tts_request" for message in mock_ws.sent)
 
     mock_ws.push(json.dumps({"type": "tts_response", "audio_data": encoded}))
 
@@ -192,7 +298,11 @@ async def test_local_tts_adapter_synthesizes(monkeypatch):
 
     assert collected == [audio_bytes]
 
-    tts_message = json.loads(mock_ws.sent[1])
+    tts_message = next(
+        json.loads(message)
+        for message in mock_ws.sent
+        if json.loads(message).get("type") == "tts_request"
+    )
     assert tts_message["type"] == "tts_request"
     assert tts_message["call_id"] == "call-3"
     assert tts_message["text"] == "Hello world"

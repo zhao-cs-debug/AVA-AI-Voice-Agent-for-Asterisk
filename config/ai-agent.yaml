@@ -19,7 +19,7 @@ barge_in:
   pipeline_talk_detect_talking_threshold: 256
   talk_detect_initial_protection_ms: 800
   post_tts_end_protection_ms: 250
-  greeting_protection_ms: 1200
+  greeting_protection_ms: 3000
   provider_fallback_enabled: true
   provider_fallback_providers:
     - google_live
@@ -1348,9 +1348,9 @@ pipelines:
     llm: native_llm
     options:
       llm:
-        # Smart Turn already emits completed utterances; keep only a tiny
-        # coalescing window here so AVA does not add another two-second wait.
-        aggregation_timeout_sec: 0.15
+        # Smart Turn emits completed utterances; AVA waits briefly for trailing
+        # final segments before committing exactly one customer turn to the LLM.
+        aggregation_timeout_sec: 0.4
         base_url: http://host.docker.internal:8080/v1
         max_tokens: 200
         model: mlx-community/Qwen3-8B-4bit
@@ -1778,6 +1778,22 @@ providers:
     continuous_input: true
     input_gain_target_rms: 0
     input_gain_max_db: 0
+  external_strategy_agent:
+    type: external_strategy_agent
+    enabled: true
+    capabilities:
+      - stt
+      - llm
+      - tts
+    base_url: ${STRATEGY_NETWORK_API_BASE_URL:-https://demo.shiwentech.com}
+    api_key_env: STRATEGY_NETWORK_API_KEY
+    input_encoding: linear16
+    input_sample_rate_hz: 16000
+    provider_input_sample_rate_hz: 16000
+    output_encoding: linear16
+    output_sample_rate_hz: 24000
+    audio_chunk_ms: 200
+    continuous_input: true
   # ElevenLabs TTS - Modular pipeline adapter for STT→LLM→TTS pipelines
   # Use with pipelines (e.g., local_stt + openai_llm + elevenlabs_tts)
   # Requires ELEVENLABS_API_KEY in .env

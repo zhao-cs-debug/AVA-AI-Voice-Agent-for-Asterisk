@@ -55,6 +55,15 @@ class PipelineOrchestratorError(Exception):
     """Raised when the pipeline orchestrator cannot resolve components."""
 
 
+class PipelineUnavailableError(PipelineOrchestratorError):
+    """Raised when a caller explicitly requests an unavailable pipeline."""
+
+    def __init__(self, pipeline_name: str, reason: str) -> None:
+        self.pipeline_name = pipeline_name
+        self.reason = reason
+        super().__init__(f"Explicit pipeline '{pipeline_name}' is unavailable: {reason}")
+
+
 @dataclass
 class PipelineResolution:
     """Snapshot of the STT/LLM/TTS adapters assigned to a call."""
@@ -356,6 +365,7 @@ class PipelineOrchestrator:
             return self._assignments[call_id]
 
         pipelines = getattr(self.config, "pipelines", {}) or {}
+        explicit = bool(pipeline_name)
         selected_name = pipeline_name or self._active_pipeline_name
 
         if not selected_name:
@@ -365,16 +375,22 @@ class PipelineOrchestrator:
                 logger.error("No pipelines available to assign", call_id=call_id)
                 return None
         if selected_name in self._invalid_pipelines:
+            reason = self._invalid_pipelines.get(selected_name, "pipeline validation failed")
+            if explicit:
+                raise PipelineUnavailableError(str(selected_name), reason)
             logger.warning(
-                "Requested pipeline is invalid; falling back to first valid pipeline",
+                "Default pipeline is invalid; resolving another available pipeline",
                 call_id=call_id,
                 requested_pipeline=selected_name,
-                error=self._invalid_pipelines.get(selected_name),
+                error=reason,
             )
             selected_name = None
 
         entry = pipelines.get(selected_name) if selected_name else None
         if entry is None or selected_name in self._invalid_pipelines:
+            if explicit:
+                reason = "pipeline does not exist" if entry is None else "pipeline validation failed"
+                raise PipelineUnavailableError(str(pipeline_name), reason)
             logger.warning(
                 "Requested pipeline not found; falling back to first available pipeline",
                 call_id=call_id,

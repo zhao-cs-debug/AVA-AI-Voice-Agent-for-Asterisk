@@ -94,6 +94,81 @@ async def test_start_streaming_playback_normalizes_audiosocket_slin(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_pipeline_stream_defers_gating_until_first_real_audio_frame(monkeypatch):
+    session_store = SessionStore()
+    call_id = "call-deferred-gating"
+    session = CallSession(call_id=call_id, caller_channel_id=call_id, provider_name="pipeline")
+    session.audio_capture_enabled = True
+    await session_store.upsert_call(session)
+    coordinator = ConversationCoordinator(session_store)
+
+    mgr = StreamingPlaybackManager(
+        session_store=session_store,
+        ari_client=_DummyARI(),
+        conversation_coordinator=coordinator,
+        streaming_config={},
+        audio_transport="audiosocket",
+    )
+    mgr.audiosocket_format = "slin"
+
+    class _DummyTask:
+        def cancel(self):
+            return None
+
+    def _fake_create_task(coro):
+        try:
+            coro.close()
+        except Exception:
+            pass
+        return _DummyTask()
+
+    monkeypatch.setattr(asyncio, "create_task", _fake_create_task)
+    stream_id = await mgr.start_streaming_playback(
+        call_id,
+        asyncio.Queue(),
+        playback_type="pipeline-tts",
+        source_encoding="mulaw",
+        source_sample_rate=8000,
+    )
+
+    session = await session_store.get_by_call_id(call_id)
+    assert stream_id is not None
+    assert session.audio_capture_enabled is True
+    assert session.tts_playing is False
+    assert mgr.active_streams[call_id]["gating_started"] is False
+
+    monkeypatch.setattr(mgr, "_send_audio_chunk", AsyncMock(return_value=True))
+    assert await mgr._emit_frame(
+        call_id,
+        stream_id,
+        b"\x00\x00" * 160,
+        "slin",
+        8000,
+        filler=True,
+    ) == "sent"
+
+    session = await session_store.get_by_call_id(call_id)
+    assert session.audio_capture_enabled is True
+    assert session.tts_playing is False
+    assert mgr.active_streams[call_id]["gating_started"] is False
+
+    assert await mgr._emit_frame(
+        call_id,
+        stream_id,
+        b"\x00\x00" * 160,
+        "slin",
+        8000,
+        filler=False,
+    ) == "sent"
+
+    session = await session_store.get_by_call_id(call_id)
+    assert session.audio_capture_enabled is False
+    assert session.tts_playing is True
+    assert stream_id in session.tts_tokens
+    assert mgr.active_streams[call_id]["gating_started"] is True
+
+
+@pytest.mark.asyncio
 async def test_start_streaming_playback_normalizes_externalmedia_ulaw(monkeypatch):
     session_store = SessionStore()
     call_id = "call-ulaw"
