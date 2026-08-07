@@ -65,13 +65,21 @@ def read_audio_clip(
     )
 
 
-def _local_provider_config(app_config) -> LocalProviderConfig:
-    raw_provider = (getattr(app_config, "providers", {}) or {}).get("local")
+def _local_provider_config(
+    app_config,
+    component: str = "local_stt",
+) -> LocalProviderConfig:
+    providers = getattr(app_config, "providers", {}) or {}
+    raw_provider = providers.get(component)
+    if raw_provider is None and component != "local":
+        raw_provider = providers.get("local")
     if isinstance(raw_provider, LocalProviderConfig):
         return raw_provider
     if not isinstance(raw_provider, dict):
         raise RuntimeError("Configured 2.0 pipeline has no local STT provider")
-    return LocalProviderConfig(**raw_provider)
+    return LocalProviderConfig(
+        **{key: value for key, value in raw_provider.items() if value is not None}
+    )
 
 
 def _pipeline_stt_options(app_config, pipeline_name: str) -> tuple[str, Dict[str, Any]]:
@@ -98,9 +106,9 @@ async def replay_audio(
     tail_silence_seconds: float,
     result_wait_seconds: float,
 ) -> Dict[str, Any]:
-    app_config = load_config(config_path)
+    app_config = load_config(config_path, merge_external_contexts=False)
     component, stt_options = _pipeline_stt_options(app_config, pipeline_name)
-    provider_config = _local_provider_config(app_config)
+    provider_config = _local_provider_config(app_config, component)
     adapter = LocalSTTAdapter(component, app_config, provider_config, stt_options)
     call_id = f"replay-{uuid.uuid4()}"
     stream_format = f"pcm16_{clip.sample_rate // 1000}k"
@@ -111,6 +119,7 @@ async def replay_audio(
 
     engine = Engine.__new__(Engine)
     engine._pipeline_barge_in_candidates = {}
+    engine._pipeline_terminating_calls = set()
 
     async def ignore_barge_in(_call_id: str, _text: str) -> bool:
         return False

@@ -75,6 +75,11 @@ from .providers.external_strategy_config import ExternalStrategyAgentConfig
 from .core import SessionStore, PlaybackManager, ConversationCoordinator
 from .core.vad_manager import EnhancedVADManager, VADResult
 from .core.streaming_playback_manager import StreamingPlaybackManager
+from .core.turn_lifecycle import (
+    TurnLifecycle,
+    TurnLifecycleState,
+    TurnLifecycleTracker,
+)
 from .core.transport_orchestrator import TransportOrchestrator, TransportProfile
 from .core.models import CallSession
 from .strategy_v1 import (
@@ -122,6 +127,7 @@ class PipelineRunnerContext:
     use_streaming: bool
     stream_format: str
     commit_bytes: int
+    dialog_ready_event: Optional[asyncio.Event] = None
 
 # -----------------------------------------------------------------------------
 # Environment variable resolution helper
@@ -609,6 +615,8 @@ class Engine:
         self._pipeline_tasks: Dict[str, asyncio.Task] = {}
         self._pipeline_transcript_queues: Dict[str, asyncio.Queue] = {}
         self._pipeline_barge_in_candidates: Dict[str, Dict[str, Any]] = {}
+        self._pipeline_turn_trackers: Dict[str, TurnLifecycleTracker] = {}
+        self._pipeline_terminating_calls: Set[str] = set()
         # Per-call background tasks (fire-and-forget) that should be cancelled on cleanup
         self._call_bg_tasks: Dict[str, Set[asyncio.Task]] = {}
         # Track calls where a pipeline was explicitly requested via AI_PROVIDER
@@ -6060,8 +6068,12 @@ class Engine:
         # in that state; ordinary final-to-final settlement remains unchanged.
         partial_final_timeout = max(settle_seconds, 1.0)
         while not stream_closed:
+            if self._is_pipeline_call_terminating(call_id):
+                return
             if buffered_event is None:
                 item = await transcript_queue.get()
+                if self._is_pipeline_call_terminating(call_id):
+                    return
                 if item is None:
                     break
                 event = self._normalize_pipeline_transcript_event(item)
@@ -6073,6 +6085,8 @@ class Engine:
             if not self._is_valid_customer_transcript(event["text"]):
                 continue
 
+            if self._is_pipeline_call_terminating(call_id):
+                return
             await self._confirm_pipeline_barge_in_candidate(call_id, event["text"])
             pending_segments = [{"text": event["text"], "event": event}]
             seen_event_ids = {event["event_id"]} if event.get("event_id") else set()
@@ -6094,6 +6108,8 @@ class Engine:
                     )
                 except asyncio.TimeoutError:
                     break
+                if self._is_pipeline_call_terminating(call_id):
+                    return
                 if next_event is None:
                     stream_closed = True
                     break
@@ -6124,6 +6140,8 @@ class Engine:
                     buffered_event = next_normalized
                     break
 
+                if self._is_pipeline_call_terminating(call_id):
+                    return
                 await self._confirm_pipeline_barge_in_candidate(call_id, next_normalized["text"])
                 same_item = bool(
                     last_segment["event"].get("item_id")
@@ -6159,6 +6177,8 @@ class Engine:
             for segment in pending_segments:
                 committed = self._merge_pipeline_transcript_segment(committed, segment["text"])
             if committed:
+                if self._is_pipeline_call_terminating(call_id):
+                    return
                 logger.info(
                     "Pipeline customer turn committed",
                     call_id=call_id,
@@ -6176,6 +6196,24 @@ class Engine:
             return False
         normalized_response = re.sub(r"\s+", " ", str(response_text or "").strip()).casefold()
         return normalized_farewell != normalized_response
+
+    def _greeting_protection_remaining_ms(
+        self,
+        session: CallSession,
+        *,
+        now: Optional[float] = None,
+    ) -> int:
+        if getattr(session, "conversation_state", None) != "greeting":
+            return 0
+        if not bool(getattr(session, "tts_playing", False)):
+            return 0
+        started_at = float(getattr(session, "tts_started_ts", 0.0) or 0.0)
+        if started_at <= 0:
+            return 0
+        cfg = getattr(self.config, "barge_in", None)
+        protection_ms = int(getattr(cfg, "greeting_protection_ms", 0) or 0)
+        elapsed_ms = max(0, int(round(((now if now is not None else time.time()) - started_at) * 1000)))
+        return max(0, protection_ms - elapsed_ms)
 
     async def _handle_channel_talking_started(self, event: dict) -> None:
         """Trigger barge-in when Asterisk detects caller speech during TTS playback.
@@ -6210,13 +6248,14 @@ class Engine:
                 tts_elapsed_ms = 0
 
             initial_protect = int(getattr(cfg, "talk_detect_initial_protection_ms", 1500))
-            try:
-                if getattr(session, "conversation_state", None) == "greeting":
-                    greet_ms = int(getattr(cfg, "greeting_protection_ms", 0))
-                    if greet_ms > initial_protect:
-                        initial_protect = greet_ms
-            except Exception:
-                pass
+            greeting_remaining_ms = self._greeting_protection_remaining_ms(session, now=now)
+            if greeting_remaining_ms > 0:
+                logger.debug(
+                    "TalkDetect suppressed during greeting protection",
+                    call_id=call_id,
+                    remaining_ms=greeting_remaining_ms,
+                )
+                return
             if tts_elapsed_ms < initial_protect:
                 logger.debug(
                     "TalkDetect suppressed (echo protection)",
@@ -6334,6 +6373,7 @@ class Engine:
         last_done = _cleanup_completed_at.get(call_id)
         if last_done and (now - float(last_done)) < ttl:
             return
+        self._mark_pipeline_call_terminating(call_id, reason="call-cleanup")
 
         async with _cleanup_lock:
             task = _cleanup_tasks.get(call_id)
@@ -6366,6 +6406,7 @@ class Engine:
                 _cleanup_in_progress.discard(call_id)
                 _cleanup_completed_at[call_id] = time.time()
                 getattr(self, "_cleanup_effects_completed", {}).pop(call_id, None)
+                getattr(self, "_pipeline_terminating_calls", set()).discard(call_id)
 
     async def _finalize_cleanup_single_flight(self, call_id: str, task: asyncio.Task) -> None:
         success = False
@@ -6382,6 +6423,7 @@ class Engine:
             if success:
                 _cleanup_completed_at[call_id] = time.time()
                 getattr(self, "_cleanup_effects_completed", {}).pop(call_id, None)
+                getattr(self, "_pipeline_terminating_calls", set()).discard(call_id)
 
     def _cleanup_effect_done(self, call_id: str, effect_key: str) -> bool:
         completed = getattr(self, "_cleanup_effects_completed", None)
@@ -6398,22 +6440,27 @@ class Engine:
         completed.setdefault(call_id, set()).add(effect_key)
 
     async def _stop_pipeline_runtime_for_cleanup(self, session: CallSession, call_id: str) -> None:
+        self._mark_pipeline_call_terminating(call_id, reason="call-terminated")
+        task = self._pipeline_tasks.pop(call_id, None)
+        if task and task is not asyncio.current_task():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                await asyncio.wait_for(task, timeout=2.0)
+
         await self._discard_pipeline_barge_in_candidate(call_id)
         try:
             await self.strategy_session_manager.end(call_id)
         except Exception:
             logger.debug("Strategy session cleanup failed", call_id=call_id, exc_info=True)
 
-        task = self._pipeline_tasks.pop(call_id, None)
-        if task and task is not asyncio.current_task():
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError, Exception):
-                await asyncio.wait_for(task, timeout=2.0)
         queue = self._pipeline_queues.pop(call_id, None)
         if queue:
             with contextlib.suppress(Exception):
                 queue.put_nowait(None)
         self._pipeline_transcript_queues.pop(call_id, None)
+        tracker = getattr(self, "_pipeline_turn_trackers", {}).pop(call_id, None)
+        if tracker:
+            tracker.clear()
         try:
             await self._disable_pipeline_talk_detect(session)
         except Exception:
@@ -6457,6 +6504,7 @@ class Engine:
 
             call_id = session.call_id
             resolved_call_id = call_id  # Save for finally block
+            self._mark_pipeline_call_terminating(call_id, reason="call-cleanup")
             self._schedule_voiceai_transcript_sink_cleanup(call_id)
 
             logger.info("Cleaning up call", call_id=call_id)
@@ -6501,6 +6549,9 @@ class Engine:
             except Exception:
                 logger.debug("Failed to persist call_outcome onto session", call_id=call_id, exc_info=True)
 
+            # Cancel the dialog/LLM/TTS runtime before waiting on playback shutdown.
+            await self._stop_pipeline_runtime_for_cleanup(session, call_id)
+
             # Stop any active streaming playback.
             try:
                 await self.streaming_playback_manager.stop_streaming_playback(call_id)
@@ -6540,7 +6591,6 @@ class Engine:
             except Exception:
                 logger.debug("Provider stop_session failed during cleanup", call_id=call_id, exc_info=True)
 
-            await self._stop_pipeline_runtime_for_cleanup(session, call_id)
             await self._close_media_transports_for_cleanup(session, call_id)
 
             # Check if call was transferred to dialplan (e.g., queue transfer)
@@ -8760,6 +8810,316 @@ class Engine:
             except asyncio.TimeoutError:
                 continue
 
+    async def _stream_pipeline_tts_audio(
+        self,
+        call_id: str,
+        stream_id: str,
+        queue: asyncio.Queue,
+        tts_stream: Any,
+        *,
+        source_encoding: str,
+        source_sample_rate: int,
+        stream_info: Optional[Dict[str, Any]] = None,
+        tolerate_inactive_stream: bool = False,
+        on_first_audio: Optional[Callable[[], None]] = None,
+    ) -> Tuple[bool, bool, bool]:
+        """Forward provider TTS audio until the provider finishes or playback stops.
+
+        Internal silence is valid synthesized audio and cannot reliably signal the
+        end of an utterance. The provider generator owns normal completion; AVA
+        closes it early only when the live playback stream has been interrupted.
+        """
+        any_audio = False
+        playback_interrupted = False
+
+        async def enqueue(chunk: bytes) -> bool:
+            if tolerate_inactive_stream:
+                return await self._enqueue_pipeline_stream_chunk(
+                    call_id,
+                    stream_id,
+                    queue,
+                    chunk,
+                )
+            await self._put_pipeline_stream_chunk(call_id, stream_id, queue, chunk)
+            return True
+
+        try:
+            async for source_chunk in tts_stream:
+                if not source_chunk:
+                    continue
+                if not any_audio:
+                    any_audio = True
+                    if on_first_audio is not None:
+                        on_first_audio()
+                if not await enqueue(source_chunk):
+                    playback_interrupted = True
+                    break
+        finally:
+            if playback_interrupted:
+                close_stream = getattr(tts_stream, "aclose", None)
+                if callable(close_stream):
+                    try:
+                        await close_stream()
+                    except Exception:
+                        logger.debug(
+                            "Pipeline TTS stream close failed",
+                            call_id=call_id,
+                            stream_id=stream_id,
+                            exc_info=True,
+                        )
+
+        return any_audio, False, playback_interrupted
+
+    def _is_pipeline_call_terminating(self, call_id: str) -> bool:
+        return call_id in getattr(self, "_pipeline_terminating_calls", set())
+
+    def _ensure_pipeline_call_active(self, call_id: str) -> None:
+        if self._is_pipeline_call_terminating(call_id):
+            raise asyncio.CancelledError(f"pipeline call {call_id} is terminating")
+
+    def _mark_pipeline_turn_terminated(self, call_id: str, *, reason: str) -> None:
+        tracker = getattr(self, "_pipeline_turn_trackers", {}).get(call_id)
+        turn = tracker.active_turn if tracker else None
+        if turn is None or turn.state in {
+            TurnLifecycleState.COMPLETED,
+            TurnLifecycleState.INTERRUPTED,
+            TurnLifecycleState.FAILED,
+        }:
+            return
+        if turn.state is TurnLifecycleState.AI_PLAYING:
+            turn.mark_interrupted(reason=reason, interrupted_at=time.time())
+        else:
+            turn.mark_failed(reason)
+
+    def _mark_pipeline_call_terminating(self, call_id: str, *, reason: str) -> None:
+        terminating_calls = getattr(self, "_pipeline_terminating_calls", None)
+        if terminating_calls is None:
+            terminating_calls = set()
+            self._pipeline_terminating_calls = terminating_calls
+        terminating_calls.add(call_id)
+        self._mark_pipeline_turn_terminated(call_id, reason=reason)
+
+    def _get_pipeline_turn_tracker(self, call_id: str) -> TurnLifecycleTracker:
+        trackers = getattr(self, "_pipeline_turn_trackers", None)
+        if trackers is None:
+            trackers = {}
+            self._pipeline_turn_trackers = trackers
+        tracker = trackers.get(call_id)
+        if tracker is None:
+            tracker = TurnLifecycleTracker(call_id)
+            trackers[call_id] = tracker
+        return tracker
+
+    async def _publish_pipeline_customer_turn(
+        self,
+        call_id: str,
+        turn: TurnLifecycle,
+    ) -> None:
+        metadata = turn.customer_metadata()
+        await self._publish_transcript_to_voiceai(
+            call_id,
+            "user",
+            turn.customer_text,
+            "local_pipeline_user",
+            event_id=metadata["event_id"],
+            turn_id=metadata["turn_id"],
+            turn_index=metadata["turn_index"],
+            turn_role_order=metadata["turn_role_order"],
+            lifecycle_state=metadata["lifecycle_state"],
+            completed_at=metadata["completed_at"],
+            timestamp=metadata["completed_at"],
+        )
+
+    async def _publish_pipeline_assistant_turn(
+        self,
+        call_id: str,
+        turn: TurnLifecycle,
+    ) -> None:
+        if not turn.audible_text:
+            return
+        metadata = turn.assistant_metadata()
+        await self._publish_transcript_to_voiceai(
+            call_id,
+            "assistant",
+            turn.audible_text,
+            "local_pipeline_agent",
+            segment_id=self._get_voiceai_transcript_segment_id(call_id, "assistant"),
+            event_id=metadata["event_id"],
+            turn_id=metadata["turn_id"],
+            turn_index=metadata["turn_index"],
+            turn_role_order=metadata["turn_role_order"],
+            lifecycle_state=metadata["lifecycle_state"],
+            started_at=metadata["started_at"],
+            completed_at=metadata["completed_at"],
+            interrupted_at=metadata["interrupted_at"],
+            playback_id=metadata["playback_id"],
+            interruption_reason=metadata["interruption_reason"],
+            audible_text_complete=metadata["audible_text_complete"],
+            timestamp=metadata["started_at"] or metadata["completed_at"] or metadata["interrupted_at"],
+        )
+
+    async def _finish_pipeline_stream_turn(
+        self,
+        turn: TurnLifecycle,
+        stream_info: Dict[str, Any],
+    ) -> str:
+        streaming_task = stream_info.get("streaming_task")
+        if streaming_task and streaming_task is not asyncio.current_task() and not streaming_task.done():
+            await asyncio.gather(streaming_task, return_exceptions=True)
+
+        emitted_bytes = int(
+            stream_info.get("real_tx_bytes", stream_info.get("tx_bytes", 0)) or 0
+        )
+        total_bytes = int(
+            stream_info.get(
+                "queued_target_total_bytes",
+                stream_info.get("queued_total_bytes", 0),
+            ) or 0
+        )
+        first_emit = stream_info.get("first_real_emit_ts")
+        last_emit = stream_info.get("last_real_emit_ts")
+        end_reason = str(stream_info.get("end_reason") or "end-of-stream")
+        completed_end_reasons = {"end-of-stream"}
+        interrupted = (
+            turn.state is TurnLifecycleState.INTERRUPTED
+            or end_reason not in completed_end_reasons
+        )
+
+        if not first_emit or emitted_bytes <= 0:
+            turn.mark_failed(end_reason if interrupted else "no_audio_emitted")
+            return ""
+        if interrupted:
+            return turn.mark_interrupted(
+                reason=turn.interruption_reason or end_reason,
+                interrupted_at=turn.playback_interrupted_at or last_emit or time.time(),
+                emitted_audio_bytes=emitted_bytes,
+                total_audio_bytes=total_bytes,
+            )
+        return turn.mark_completed(
+            started_at=float(first_emit),
+            completed_at=float(last_emit or time.time()),
+        )
+
+    async def _abort_pipeline_stream_turn(
+        self,
+        call_id: str,
+        turn: TurnLifecycle,
+        stream_info: Optional[Dict[str, Any]],
+        reason: str,
+    ) -> str:
+        if stream_info is not None:
+            stream_info["end_reason"] = str(reason or "stream-aborted")
+        try:
+            await self.streaming_playback_manager.stop_streaming_playback(call_id)
+        except Exception:
+            logger.debug(
+                "Pipeline stream abort failed",
+                call_id=call_id,
+                reason=reason,
+                exc_info=True,
+            )
+        if stream_info is None:
+            turn.mark_failed(reason)
+            return ""
+        return await self._finish_pipeline_stream_turn(turn, stream_info)
+
+    async def _play_pipeline_followup_turn(
+        self,
+        call_id: str,
+        session: CallSession,
+        pipeline: Any,
+        turn: TurnLifecycle,
+        response_text: str,
+        conversation_history: List[Dict[str, Any]],
+    ) -> None:
+        """Play and publish a tool-only turn's follow-up through the same lifecycle."""
+        if turn.state is TurnLifecycleState.FAILED:
+            turn.reset_ai_attempt()
+            turn.mark_ai_generating()
+        turn.mark_ai_generated(response_text)
+        tts_bytes = bytearray()
+        try:
+            async for chunk in pipeline.tts_adapter.synthesize(
+                call_id,
+                response_text,
+                pipeline.tts_options,
+            ):
+                if chunk:
+                    tts_bytes.extend(chunk)
+        except Exception:
+            turn.mark_failed("tool_followup_tts_failed")
+            logger.debug("Pipeline tool follow-up TTS failed", call_id=call_id, exc_info=True)
+            return
+        if not tts_bytes:
+            turn.mark_failed("tool_followup_no_audio")
+            return
+
+        playback_id = await self.playback_manager.play_audio(
+            call_id,
+            bytes(tts_bytes),
+            "pipeline-tts",
+        )
+        if not playback_id:
+            turn.mark_failed("tool_followup_playback_failed")
+            return
+        turn.mark_ai_playing(playback_id, started_at=time.time())
+        await self._finish_pipeline_file_turn(
+            call_id,
+            turn,
+            playback_id,
+            audio_bytes=len(tts_bytes),
+        )
+        if turn.state not in {
+            TurnLifecycleState.COMPLETED,
+            TurnLifecycleState.INTERRUPTED,
+        }:
+            return
+        try:
+            await self._publish_pipeline_assistant_turn(call_id, turn)
+        except Exception:
+            logger.debug(
+                "Pipeline tool follow-up transcript publish failed",
+                call_id=call_id,
+                exc_info=True,
+            )
+        if turn.audible_text:
+            conversation_history.append(
+                _ts_msg(
+                    "assistant",
+                    turn.audible_text,
+                    turn_id=turn.turn_id,
+                    lifecycle_state=turn.state.value,
+                )
+            )
+            session.conversation_history = list(conversation_history)
+            await self.session_store.upsert_call(session)
+
+    async def _finish_pipeline_file_turn(
+        self,
+        call_id: str,
+        turn: TurnLifecycle,
+        playback_id: str,
+        *,
+        audio_bytes: int,
+        bytes_per_second: int = 8000,
+    ) -> str:
+        expected_seconds = float(audio_bytes) / float(max(1, bytes_per_second))
+        finished = await self.playback_manager.wait_for_playback_end(
+            call_id,
+            playback_id,
+            timeout_sec=expected_seconds + 3.0,
+        )
+        if turn.state is TurnLifecycleState.INTERRUPTED:
+            return turn.mark_interrupted(
+                reason=turn.interruption_reason or "barge-in",
+                interrupted_at=turn.playback_interrupted_at or time.time(),
+                expected_audio_seconds=expected_seconds,
+            )
+        if not finished:
+            turn.mark_failed("playback_timeout")
+            return ""
+        return turn.mark_completed(completed_at=time.time())
+
     async def _apply_barge_in_action(self, call_id: str, *, source: str, reason: str) -> bool:
         """Apply platform-owned barge-in actions (flush local output only).
 
@@ -8781,6 +9141,10 @@ class Engine:
                     reason=reason,
                 )
                 return False
+
+            tracker = getattr(self, "_pipeline_turn_trackers", {}).get(call_id)
+            if tracker:
+                tracker.interrupt_active(reason=reason, interrupted_at=time.time())
 
             # Mark the external text turn stale before stopping AVA playback.
             # Otherwise the stream can disappear while its producer still sees
@@ -8844,7 +9208,6 @@ class Engine:
 
             # Reset candidate window and record observability.
             try:
-                import time
                 now = time.time()
                 session.barge_in_candidate_ms = 0
                 session.last_barge_in_ts = now
@@ -11138,6 +11501,17 @@ class Engine:
         *,
         segment_id: Optional[str] = None,
         event_id: Optional[str] = None,
+        turn_id: Optional[str] = None,
+        turn_index: Optional[int] = None,
+        turn_role_order: Optional[int] = None,
+        lifecycle_state: Optional[str] = None,
+        started_at: Optional[str] = None,
+        completed_at: Optional[str] = None,
+        interrupted_at: Optional[str] = None,
+        playback_id: Optional[str] = None,
+        interruption_reason: Optional[str] = None,
+        audible_text_complete: Optional[bool] = None,
+        timestamp: Optional[str] = None,
     ) -> None:
         if not call_id or not text:
             return
@@ -11149,9 +11523,22 @@ class Engine:
             "segment_id": segment_id,
             "event_id": event_id,
             "backend": self._resolve_voiceai_transcript_sink(call_id),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": timestamp or datetime.now(timezone.utc).isoformat(),
             "final": True,
         }
+        lifecycle_fields = {
+            "turn_id": turn_id,
+            "turn_index": turn_index,
+            "turn_role_order": turn_role_order,
+            "lifecycle_state": lifecycle_state,
+            "started_at": started_at,
+            "completed_at": completed_at,
+            "interrupted_at": interrupted_at,
+            "playback_id": playback_id,
+            "interruption_reason": interruption_reason,
+            "audible_text_complete": audible_text_complete,
+        }
+        event.update({key: value for key, value in lifecycle_fields.items() if value is not None})
         try:
             self._voiceai_transcript_queue.put_nowait(event)
         except asyncio.QueueFull:
@@ -11297,6 +11684,20 @@ class Engine:
         event_id = event.get("event_id")
         if event_id:
             payload["event_id"] = str(event_id)
+        for key in (
+            "turn_id",
+            "turn_index",
+            "turn_role_order",
+            "lifecycle_state",
+            "started_at",
+            "completed_at",
+            "interrupted_at",
+            "playback_id",
+            "interruption_reason",
+            "audible_text_complete",
+        ):
+            if event.get(key) is not None:
+                payload[key] = event[key]
         headers = {
             "Content-Type": "application/json",
             "X-AI-Engine-Token": self._voiceai_backend_token,
@@ -11981,7 +12382,7 @@ class Engine:
         self._pipeline_queues[call_id] = q
         # Pre-create transcript queue so early flush (via TalkDetect) can enqueue
         # transcripts before _pipeline_runner reaches its own queue setup.
-        self._pipeline_transcript_queues.setdefault(call_id, asyncio.Queue(maxsize=8))
+        self._pipeline_transcript_queues.setdefault(call_id, asyncio.Queue(maxsize=64))
         self._pipeline_forced[call_id] = bool(forced)
         # Pipelines: enable Asterisk talk detection so barge-in can trigger even when
         # ExternalMedia RTP delivery is paused/altered during channel playback.
@@ -12183,7 +12584,7 @@ class Engine:
 
         buffer_queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=200)
         # Reuse queue created by _ensure_pipeline_runner, or create if missing
-        transcript_queue: asyncio.Queue[Optional[str]] = self._pipeline_transcript_queues.get(call_id) or asyncio.Queue(maxsize=8)
+        transcript_queue: asyncio.Queue[Optional[str]] = self._pipeline_transcript_queues.get(call_id) or asyncio.Queue(maxsize=64)
         self._pipeline_transcript_queues[call_id] = transcript_queue
 
         use_streaming = bool(stt_options.get("streaming", True))
@@ -12225,6 +12626,7 @@ class Engine:
             use_streaming=use_streaming,
             stream_format=stream_format,
             commit_bytes=commit_bytes,
+            dialog_ready_event=asyncio.Event(),
         )
 
     async def _start_pipeline_strategy(self, context: PipelineRunnerContext) -> bool:
@@ -12351,23 +12753,47 @@ class Engine:
             greeting = self._apply_prompt_template_substitution(greeting, session)
 
         if greeting:
-            try:
-                await self._publish_transcript_to_voiceai(
-                    call_id,
-                    "assistant",
-                    greeting,
-                    "local_pipeline_agent",
-                    segment_id=self._get_voiceai_transcript_segment_id(call_id, "assistant"),
-                )
-            except Exception:
-                logger.debug(
-                    "Local pipeline greeting transcript publish failed",
-                    call_id=call_id,
-                    exc_info=True,
-                )
+            greeting_turn = self._get_pipeline_turn_tracker(call_id).begin_greeting(greeting)
+
+            async def record_greeting_turn() -> None:
+                if not greeting_turn.audible_text:
+                    return
+                try:
+                    await self._publish_pipeline_assistant_turn(call_id, greeting_turn)
+                except Exception:
+                    logger.debug(
+                        "Pipeline greeting transcript publish failed",
+                        call_id=call_id,
+                        exc_info=True,
+                    )
+                try:
+                    already_recorded = any(
+                        item.get("role") == "assistant"
+                        and item.get("turn_id") == greeting_turn.turn_id
+                        for item in (session.conversation_history or [])
+                    )
+                    if not already_recorded:
+                        session.conversation_history.append(
+                            _ts_msg(
+                                "assistant",
+                                greeting_turn.audible_text,
+                                turn_id=greeting_turn.turn_id,
+                                lifecycle_state=greeting_turn.state.value,
+                            )
+                        )
+                    await self.session_store.upsert_call(session)
+                    logger.info("Persisted initial greeting to session history", call_id=call_id)
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to persist greeting history",
+                        call_id=call_id,
+                        error=str(exc),
+                    )
 
             max_attempts = 2
             for attempt in range(1, max_attempts + 1):
+                stream_info: Optional[Dict[str, Any]] = None
+                stream_finalized = False
                 try:
                     # Resolve effective downstream mode: TTS adapter can override global setting.
                     # getattr fallback keeps this generic — works for any adapter, not just Azure.
@@ -12401,6 +12827,10 @@ class Engine:
                         )
                         if not stream_id:
                             raise RuntimeError("start_streaming_playback returned no stream_id")
+                        stream_info = self.streaming_playback_manager.active_streams.get(call_id)
+                        if not stream_info:
+                            raise RuntimeError("streaming playback state was not created")
+                        greeting_turn.mark_ai_playing(stream_id, started_at=time.time())
                         any_audio = False
                         stream_interrupted = False
                         tts_stream = pipeline.tts_adapter.synthesize(
@@ -12408,48 +12838,38 @@ class Engine:
                             greeting,
                             pipeline.tts_options,
                         )
-                        try:
-                            async for chunk in tts_stream:
-                                if not chunk:
-                                    continue
-                                any_audio = True
-                                if not await self._enqueue_pipeline_stream_chunk(
-                                    call_id,
-                                    stream_id,
-                                    q,
-                                    chunk,
-                                ):
-                                    stream_interrupted = True
-                                    logger.info(
-                                        "Pipeline greeting producer stopped after playback ended",
-                                        call_id=call_id,
-                                        stream_id=stream_id,
-                                    )
-                                    break
-                        finally:
-                            if stream_interrupted:
-                                close_stream = getattr(tts_stream, "aclose", None)
-                                if callable(close_stream):
-                                    await close_stream()
+                        any_audio, _audible_end, stream_interrupted = (
+                            await self._stream_pipeline_tts_audio(
+                                call_id,
+                                stream_id,
+                                q,
+                                tts_stream,
+                                source_encoding=tts_encoding,
+                                source_sample_rate=tts_rate,
+                                stream_info=stream_info,
+                                tolerate_inactive_stream=True,
+                            )
+                        )
+                        if stream_interrupted:
+                            logger.info(
+                                "Pipeline greeting producer stopped after playback ended",
+                                call_id=call_id,
+                                stream_id=stream_id,
+                            )
                         if not stream_interrupted:
                             try:
                                 q.put_nowait(None)
                             except asyncio.QueueFull:
-                                asyncio.create_task(q.put(None))
+                                await q.put(None)
                         if not any_audio:
                             logger.warning(
                                 "Pipeline greeting produced no audio",
                                 call_id=call_id,
                                 attempt=attempt,
                             )
-                        else:
-                            # AAVA-85: Persist greeting to session history so it appears in email summary
-                            try:
-                                session.conversation_history.append(_ts_msg("assistant", greeting))
-                                await self.session_store.upsert_call(session)
-                                logger.info("Persisted initial greeting to session history", call_id=call_id)
-                            except Exception as e:
-                                logger.warning("Failed to persist greeting history", call_id=call_id, error=str(e))
+                        await self._finish_pipeline_stream_turn(greeting_turn, stream_info)
+                        stream_finalized = True
+                        await record_greeting_turn()
                     else:
                         tts_bytes = bytearray()
                         async for chunk in pipeline.tts_adapter.synthesize(call_id, greeting, pipeline.tts_options):
@@ -12462,20 +12882,38 @@ class Engine:
                                 attempt=attempt,
                             )
                         else:
-                            await self.playback_manager.play_audio(call_id, bytes(tts_bytes), "pipeline-tts-greeting")
-
-                            # AAVA-85: Persist greeting to session history so it appears in email summary
-                            try:
-                                session.conversation_history.append(_ts_msg("assistant", greeting))
-                                await self.session_store.upsert_call(session)
-                                logger.info("Persisted initial greeting to session history", call_id=call_id)
-                            except Exception as e:
-                                logger.warning("Failed to persist greeting history", call_id=call_id, error=str(e))
+                            playback_id = await self.playback_manager.play_audio(
+                                call_id,
+                                bytes(tts_bytes),
+                                "pipeline-tts-greeting",
+                            )
+                            if not playback_id:
+                                raise RuntimeError("greeting playback did not start")
+                            greeting_turn.mark_ai_playing(playback_id, started_at=time.time())
+                            await self._finish_pipeline_file_turn(
+                                call_id,
+                                greeting_turn,
+                                playback_id,
+                                audio_bytes=len(tts_bytes),
+                            )
+                            await record_greeting_turn()
 
                     break
                 except RuntimeError as exc:
+                    if stream_info is not None and not stream_finalized:
+                        await self._abort_pipeline_stream_turn(
+                            call_id,
+                            greeting_turn,
+                            stream_info,
+                            "greeting-tts-error",
+                        )
+                        await record_greeting_turn()
+                        if greeting_turn.audible_text:
+                            break
                     error_text = str(exc).lower()
                     if attempt < max_attempts and "session" in error_text:
+                        greeting_turn.reset_ai_attempt()
+                        greeting_turn.mark_ai_generated(greeting)
                         logger.debug(
                             "Pipeline greeting retry after session error",
                             call_id=call_id,
@@ -12501,6 +12939,14 @@ class Engine:
                     )
                     break
                 except Exception:
+                    if stream_info is not None and not stream_finalized:
+                        await self._abort_pipeline_stream_turn(
+                            call_id,
+                            greeting_turn,
+                            stream_info,
+                            "greeting-unexpected-error",
+                        )
+                        await record_greeting_turn()
                     logger.error(
                         "Pipeline greeting unexpected failure",
                         call_id=call_id,
@@ -12569,6 +13015,8 @@ class Engine:
                     self._last_transcript_ts[call_id] = time.time()
                 except Exception:
                     pass
+                if self._is_valid_customer_transcript(transcript):
+                    await self._confirm_pipeline_barge_in_candidate(call_id, transcript)
                 try:
                     transcript_queue.put_nowait(transcript)
                 except asyncio.QueueFull:
@@ -12654,14 +13102,15 @@ class Engine:
                     )
                     async for transcript_event in results:
                         try:
-                            is_final = not isinstance(transcript_event, dict) or bool(
-                                transcript_event.get(
-                                    "is_final",
-                                    not transcript_event.get("is_partial", False),
-                                )
-                            )
+                            normalized_event = self._normalize_pipeline_transcript_event(transcript_event)
+                            is_final = bool(normalized_event["is_final"] and not normalized_event["is_partial"])
                             if is_final:
                                 self._last_transcript_ts[call_id] = time.time()
+                                if self._is_valid_customer_transcript(normalized_event["text"]):
+                                    await self._confirm_pipeline_barge_in_candidate(
+                                        call_id,
+                                        normalized_event["text"],
+                                    )
                             transcript_queue.put_nowait(transcript_event)
                         except asyncio.QueueFull:
                             try:
@@ -12733,6 +13182,11 @@ class Engine:
         strategy_runtime = context.strategy_runtime
         llm_options = context.llm_options
         transcript_queue = context.transcript_queue
+        dialog_ready_event = getattr(context, "dialog_ready_event", None)
+        if dialog_ready_event is not None:
+            await dialog_ready_event.wait()
+        if self._is_pipeline_call_terminating(call_id):
+            return
         settle_seconds = float(
             (pipeline.llm_options or {}).get(
                 "turn_settlement_timeout_sec",
@@ -12745,12 +13199,13 @@ class Engine:
 
         async def run_turn(transcript_text: str) -> None:
             nonlocal conversation_history
+            self._ensure_pipeline_call_active(call_id)
             response_text = ""
             tool_calls = []
             _streaming_handled = False  # Set True when streaming overlap played audio + recorded history
             turn_start_time = time.time()  # Track turn latency for call history
             voiceai_assistant_published = False
-            user_event_id = f"{call_id}:user:{uuid.uuid4().hex}"
+            lifecycle_turn: Optional[TurnLifecycle] = None
 
             pipeline_label = getattr(session, 'pipeline_name', None) or 'none'
             provider_label = getattr(session, 'provider_name', None) or 'unknown'
@@ -12760,23 +13215,24 @@ class Engine:
             # System prompt only in first turn (when history is empty)
             context_for_llm = {"prior_messages": _sanitize_for_llm(conversation_history)}
 
-            try:
-                await self._publish_transcript_to_voiceai(
-                    call_id,
-                    "user",
-                    transcript_text,
-                    "local_pipeline_user",
-                    event_id=user_event_id,
-                )
-            except Exception:
-                logger.debug(
-                    "Local pipeline user transcript publish failed",
-                    call_id=call_id,
-                    exc_info=True,
-                )
-
             if strategy_runtime:
+                self._ensure_pipeline_call_active(call_id)
                 try:
+                    await self._publish_transcript_to_voiceai(
+                        call_id,
+                        "user",
+                        transcript_text,
+                        "local_pipeline_user",
+                        event_id=f"{call_id}:user:{uuid.uuid4().hex}",
+                    )
+                except Exception:
+                    logger.debug(
+                        "Local pipeline user transcript publish failed",
+                        call_id=call_id,
+                        exc_info=True,
+                    )
+                try:
+                    self._ensure_pipeline_call_active(call_id)
                     await self._run_strategy_pipeline_turn(
                         call_id,
                         session,
@@ -12812,6 +13268,28 @@ class Engine:
                     )
                 return
 
+            self._ensure_pipeline_call_active(call_id)
+            lifecycle_turn = self._get_pipeline_turn_tracker(call_id).commit_customer(transcript_text)
+            conversation_history.append(
+                _ts_msg(
+                    "user",
+                    transcript_text,
+                    turn_id=lifecycle_turn.turn_id,
+                    lifecycle_state=lifecycle_turn.state.value,
+                )
+            )
+            session.conversation_history = list(conversation_history)
+            await self.session_store.upsert_call(session)
+            try:
+                await self._publish_pipeline_customer_turn(call_id, lifecycle_turn)
+            except Exception:
+                logger.debug(
+                    "Local pipeline user transcript publish failed",
+                    call_id=call_id,
+                    exc_info=True,
+                )
+            self._ensure_pipeline_call_active(call_id)
+
             # ── Pipeline filler audio: instant ack before LLM ──
             # Uses fire-and-forget: synthesize filler, push all chunks, send
             # EOS sentinel, then stop_streaming_playback so the slot is free
@@ -12824,6 +13302,7 @@ class Engine:
                     import random as _rnd
                     _filler_text = _rnd.choice(_filler_phrases)
                     try:
+                        self._ensure_pipeline_call_active(call_id)
                         _filler_q: asyncio.Queue = asyncio.Queue(maxsize=64)
                         _old_pn = getattr(session, "provider_name", None)
                         self._assign_session_provider(session, "pipeline")
@@ -12847,6 +13326,7 @@ class Engine:
                         )
                         if _filler_sid:
                             async for _fc in pipeline.tts_adapter.synthesize(call_id, _filler_text, pipeline.tts_options):
+                                self._ensure_pipeline_call_active(call_id)
                                 if _fc:
                                     await _filler_q.put(_fc)
                             try:
@@ -12908,8 +13388,10 @@ class Engine:
                 sentence_buffer = ""
                 full_response_text = ""
                 first_tts_ts: Optional[float] = None
+                lifecycle_turn.mark_ai_generating()
 
                 stream_q: asyncio.Queue = asyncio.Queue(maxsize=256)
+                stream_info: Optional[Dict[str, Any]] = None
                 old_provider_name = getattr(session, "provider_name", None)
                 try:
                     self._assign_session_provider(session, "pipeline")
@@ -12918,6 +13400,7 @@ class Engine:
                     pass
 
                 try:
+                    self._ensure_pipeline_call_active(call_id)
                     tts_format = (pipeline.tts_options or {}).get("format")
                     if not isinstance(tts_format, dict):
                         tts_format = (pipeline.tts_options or {}).get("target_format")
@@ -12938,10 +13421,31 @@ class Engine:
                     )
                     if not stream_id:
                         raise RuntimeError("start_streaming_playback returned no stream_id")
+                    stream_info = self.streaming_playback_manager.active_streams.get(call_id)
+                    if not stream_info:
+                        raise RuntimeError("streaming playback state was not created")
+                    lifecycle_turn.mark_ai_playing(stream_id, started_at=time.time())
 
+                    def observe_first_tts_audio() -> None:
+                        nonlocal first_tts_ts
+                        if first_tts_ts is not None:
+                            return
+                        first_tts_ts = time.time()
+                        turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
+                        session.turn_latencies_ms.append(turn_latency_ms)
+                        try:
+                            if t_start is not None:
+                                _TURN_STT_TO_TTS.labels(pipeline_label, provider_label).observe(
+                                    max(0.0, first_tts_ts - t_start)
+                                )
+                        except Exception:
+                            pass
+
+                    self._ensure_pipeline_call_active(call_id)
                     async for token in pipeline.llm_adapter.generate_stream(
                         call_id, transcript_text, context_for_llm, llm_options,
                     ):
+                        self._ensure_pipeline_call_active(call_id)
                         sentence_buffer += token
                         full_response_text += token
 
@@ -12952,44 +13456,45 @@ class Engine:
                             sentence_buffer = sentence_buffer[split_pos:]
 
                             if to_speak:
-                                async for tts_chunk in pipeline.tts_adapter.synthesize(
+                                self._ensure_pipeline_call_active(call_id)
+                                tts_stream = pipeline.tts_adapter.synthesize(
                                     call_id, to_speak, pipeline.tts_options,
-                                ):
-                                    if tts_chunk:
-                                        if first_tts_ts is None:
-                                            first_tts_ts = time.time()
-                                            turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
-                                            session.turn_latencies_ms.append(turn_latency_ms)
-                                            try:
-                                                if t_start is not None:
-                                                    _TURN_STT_TO_TTS.labels(pipeline_label, provider_label).observe(
-                                                        max(0.0, first_tts_ts - t_start)
-                                                    )
-                                            except Exception:
-                                                pass
-                                        await self._put_pipeline_stream_chunk(
-                                            call_id, stream_id, stream_q, tts_chunk
-                                        )
+                                )
+                                await self._stream_pipeline_tts_audio(
+                                    call_id,
+                                    stream_id,
+                                    stream_q,
+                                    tts_stream,
+                                    source_encoding=tts_encoding,
+                                    source_sample_rate=tts_rate,
+                                    stream_info=stream_info,
+                                    on_first_audio=observe_first_tts_audio,
+                                )
 
                     # Flush remaining sentence buffer
                     remainder = sentence_buffer.strip()
                     if remainder:
-                        async for tts_chunk in pipeline.tts_adapter.synthesize(
+                        self._ensure_pipeline_call_active(call_id)
+                        tts_stream = pipeline.tts_adapter.synthesize(
                             call_id, remainder, pipeline.tts_options,
-                        ):
-                            if tts_chunk:
-                                if first_tts_ts is None:
-                                    first_tts_ts = time.time()
-                                    turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
-                                    session.turn_latencies_ms.append(turn_latency_ms)
-                                await self._put_pipeline_stream_chunk(
-                                    call_id, stream_id, stream_q, tts_chunk
-                                )
+                        )
+                        await self._stream_pipeline_tts_audio(
+                            call_id,
+                            stream_id,
+                            stream_q,
+                            tts_stream,
+                            source_encoding=tts_encoding,
+                            source_sample_rate=tts_rate,
+                            stream_info=stream_info,
+                            on_first_audio=observe_first_tts_audio,
+                        )
 
+                    lifecycle_turn.mark_ai_generated(full_response_text.strip())
                     # End-of-segment sentinel
                     await self._put_pipeline_stream_chunk(
                         call_id, stream_id, stream_q, None
                     )
+                    await self._finish_pipeline_stream_turn(lifecycle_turn, stream_info)
                     try:
                         if t_start is not None:
                             _TURN_RESPONSE_SECONDS.labels(pipeline_label, provider_label).observe(
@@ -13004,23 +13509,77 @@ class Engine:
                         call_id=call_id,
                         stream_id=stream_id,
                     )
+                    lifecycle_turn.mark_ai_generated(full_response_text.strip())
                     try:
                         await self.streaming_playback_manager.stop_streaming_playback(call_id)
                     except Exception:
                         pass
+                    if stream_info:
+                        await self._finish_pipeline_stream_turn(lifecycle_turn, stream_info)
+                    if lifecycle_turn.audible_text:
+                        try:
+                            await self._publish_pipeline_assistant_turn(call_id, lifecycle_turn)
+                            voiceai_assistant_published = True
+                        except Exception:
+                            logger.debug(
+                                "Interrupted pipeline assistant transcript publish failed",
+                                call_id=call_id,
+                                exc_info=True,
+                            )
+                        conversation_history.append(
+                            _ts_msg(
+                                "assistant",
+                                lifecycle_turn.audible_text,
+                                turn_id=lifecycle_turn.turn_id,
+                                lifecycle_state=lifecycle_turn.state.value,
+                            )
+                        )
+                        session.conversation_history = list(conversation_history)
+                        await self.session_store.upsert_call(session)
                     return
                 except Exception:
                     logger.error(
-                        "Pipeline streaming overlap failed; falling through to serial path",
+                        "Pipeline streaming overlap failed",
                         call_id=call_id,
                         exc_info=True,
                     )
+                    partial_response = full_response_text.strip()
+                    if stream_info is not None:
+                        stream_info["end_reason"] = "streaming-overlap-error"
                     try:
                         await self.streaming_playback_manager.stop_streaming_playback(call_id)
                     except Exception:
                         pass
                     # Don't return — fall through to serial path below
                     full_response_text = ""
+                    lifecycle_turn.mark_failed("streaming_overlap_failed")
+                    if partial_response:
+                        lifecycle_turn.mark_ai_generated(partial_response)
+                    if stream_info is not None:
+                        await self._finish_pipeline_stream_turn(lifecycle_turn, stream_info)
+                    if lifecycle_turn.state is TurnLifecycleState.INTERRUPTED:
+                        if lifecycle_turn.audible_text:
+                            try:
+                                await self._publish_pipeline_assistant_turn(call_id, lifecycle_turn)
+                                voiceai_assistant_published = True
+                            except Exception:
+                                logger.debug(
+                                    "Partial pipeline assistant transcript publish failed",
+                                    call_id=call_id,
+                                    exc_info=True,
+                                )
+                            conversation_history.append(
+                                _ts_msg(
+                                    "assistant",
+                                    lifecycle_turn.audible_text,
+                                    turn_id=lifecycle_turn.turn_id,
+                                    lifecycle_state=lifecycle_turn.state.value,
+                                )
+                            )
+                            session.conversation_history = list(conversation_history)
+                            await self.session_store.upsert_call(session)
+                        return
+                    lifecycle_turn.reset_ai_attempt()
                 finally:
                     try:
                         self._assign_session_provider(session, old_provider_name)
@@ -13031,25 +13590,33 @@ class Engine:
                 if full_response_text.strip():
                     response_text = full_response_text.strip()
                     _streaming_handled = True
-                    try:
-                        await self._publish_transcript_to_voiceai(
-                            call_id,
-                            "assistant",
-                            response_text,
-                            "local_pipeline_agent",
-                            segment_id=self._get_voiceai_transcript_segment_id(call_id, "assistant"),
+                    if lifecycle_turn.state in {
+                        TurnLifecycleState.COMPLETED,
+                        TurnLifecycleState.INTERRUPTED,
+                    }:
+                        try:
+                            await self._publish_pipeline_assistant_turn(call_id, lifecycle_turn)
+                            voiceai_assistant_published = bool(lifecycle_turn.audible_text)
+                        except Exception:
+                            logger.debug(
+                                "Local pipeline assistant transcript publish failed",
+                                call_id=call_id,
+                                exc_info=True,
+                            )
+                    if lifecycle_turn.audible_text:
+                        conversation_history.append(
+                            _ts_msg(
+                                "assistant",
+                                lifecycle_turn.audible_text,
+                                turn_id=lifecycle_turn.turn_id,
+                                lifecycle_state=lifecycle_turn.state.value,
+                            )
                         )
-                        voiceai_assistant_published = True
-                    except Exception:
-                        logger.debug(
-                            "Local pipeline assistant transcript publish failed",
-                            call_id=call_id,
-                            exc_info=True,
-                        )
-                    conversation_history.append(_ts_msg("user", transcript_text))
-                    conversation_history.append(_ts_msg("assistant", response_text))
                     session.conversation_history = list(conversation_history)
                     await self.session_store.upsert_call(session)
+
+                    if lifecycle_turn.state is TurnLifecycleState.INTERRUPTED:
+                        return
 
                     # Check for tool calls detected during streaming
                     _pending_tools = getattr(pipeline.llm_adapter, "_pending_tool_calls_by_call", {}).get(call_id) or []
@@ -13090,6 +13657,8 @@ class Engine:
             # ── Serial path (original) ──
             # Skip if streaming path already set tool_calls
             if not tool_calls:
+                self._ensure_pipeline_call_active(call_id)
+                lifecycle_turn.mark_ai_generating()
                 try:
                     llm_result = await pipeline.llm_adapter.generate(
                         call_id,
@@ -13099,7 +13668,9 @@ class Engine:
                     )
                 except Exception:
                     logger.debug("LLM generate failed", call_id=call_id, exc_info=True)
+                    lifecycle_turn.mark_failed("llm_generate_failed")
                     return
+                self._ensure_pipeline_call_active(call_id)
 
                 # Handle structured LLM response with tool calls
                 if isinstance(llm_result, LLMResponse):
@@ -13239,31 +13810,16 @@ class Engine:
                         )
 
             if not response_text and not tool_calls:
+                lifecycle_turn.mark_failed("llm_empty_response")
                 return
 
-            if response_text and not voiceai_assistant_published:
-                try:
-                    await self._publish_transcript_to_voiceai(
-                        call_id,
-                        "assistant",
-                        response_text,
-                        "local_pipeline_agent",
-                        segment_id=self._get_voiceai_transcript_segment_id(call_id, "assistant"),
-                    )
-                    voiceai_assistant_published = True
-                except Exception:
-                    logger.debug(
-                        "Local pipeline assistant transcript publish failed",
-                        call_id=call_id,
-                        exc_info=True,
-                    )
+            if response_text and not _streaming_handled:
+                self._ensure_pipeline_call_active(call_id)
+                lifecycle_turn.mark_ai_generated(response_text)
 
             # Update conversation history (skip if streaming path already did this)
-            if not _streaming_handled:
-                conversation_history.append(_ts_msg("user", transcript_text))
-                if response_text:
-                    conversation_history.append(_ts_msg("assistant", response_text))
-                elif tool_calls:
+            if not _streaming_handled and tool_calls and not response_text:
+                if tool_calls:
                     conversation_history.append(_ts_msg("assistant", "(tool execution)"))
 
                 # AAVA-85: Persist session history so tools (email) can access it
@@ -13275,6 +13831,7 @@ class Engine:
             # 1. Synthesize and Play Text (if any)
             # Skip TTS if streaming path already played audio
             if response_text and not _streaming_handled:
+                self._ensure_pipeline_call_active(call_id)
                 # Resolve effective downstream mode: TTS adapter can override global setting.
                 _tts_dm_override = getattr(pipeline.tts_adapter, "downstream_mode_override", "auto") or "auto"
                 logger.debug(f"TTS Adapter DM Override evaluated as: {_tts_dm_override} on adapter {pipeline.tts_adapter.__class__.__name__}")
@@ -13287,8 +13844,10 @@ class Engine:
                 if use_streaming_playback:
                     stream_q: asyncio.Queue = asyncio.Queue(maxsize=256)
                     stream_id: Optional[str] = None
+                    stream_info: Optional[Dict[str, Any]] = None
                     old_provider_name = getattr(session, "provider_name", None)
                     try:
+                        self._ensure_pipeline_call_active(call_id)
                         # Provide a stable provider label for adaptive streaming + metrics
                         self._assign_session_provider(session, "pipeline")
                         await self.session_store.upsert_call(session)
@@ -13315,29 +13874,50 @@ class Engine:
                         )
                         if not stream_id:
                             raise RuntimeError("start_streaming_playback returned no stream_id")
+                        stream_info = self.streaming_playback_manager.active_streams.get(call_id)
+                        if not stream_info:
+                            raise RuntimeError("streaming playback state was not created")
                         playback_id = stream_id
+                        lifecycle_turn.mark_ai_playing(stream_id, started_at=time.time())
                         first_tts_ts: Optional[float] = None
 
-                        async for tts_chunk in pipeline.tts_adapter.synthesize(call_id, response_text, pipeline.tts_options):
-                            if not tts_chunk:
-                                continue
-                            if first_tts_ts is None:
-                                first_tts_ts = time.time()
-                                turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
-                                session.turn_latencies_ms.append(turn_latency_ms)
-                                try:
-                                    if t_start is not None:
-                                        _TURN_STT_TO_TTS.labels(pipeline_label, provider_label).observe(max(0.0, first_tts_ts - t_start))
-                                except Exception:
-                                    pass
-                            await self._put_pipeline_stream_chunk(
-                                call_id, stream_id, stream_q, tts_chunk
-                            )
+                        def observe_first_tts_audio() -> None:
+                            nonlocal first_tts_ts
+                            if first_tts_ts is not None:
+                                return
+                            first_tts_ts = time.time()
+                            turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
+                            session.turn_latencies_ms.append(turn_latency_ms)
+                            try:
+                                if t_start is not None:
+                                    _TURN_STT_TO_TTS.labels(pipeline_label, provider_label).observe(
+                                        max(0.0, first_tts_ts - t_start)
+                                    )
+                            except Exception:
+                                pass
+
+                        self._ensure_pipeline_call_active(call_id)
+                        tts_stream = pipeline.tts_adapter.synthesize(
+                            call_id,
+                            response_text,
+                            pipeline.tts_options,
+                        )
+                        await self._stream_pipeline_tts_audio(
+                            call_id,
+                            stream_id,
+                            stream_q,
+                            tts_stream,
+                            source_encoding=tts_encoding,
+                            source_sample_rate=tts_rate,
+                            stream_info=stream_info,
+                            on_first_audio=observe_first_tts_audio,
+                        )
 
                         # End-of-segment sentinel
                         await self._put_pipeline_stream_chunk(
                             call_id, stream_id, stream_q, None
                         )
+                        await self._finish_pipeline_stream_turn(lifecycle_turn, stream_info)
                         try:
                             if playback_id and t_start is not None:
                                 _TURN_RESPONSE_SECONDS.labels(pipeline_label, provider_label).observe(max(0.0, time.time() - t_start))
@@ -13353,35 +13933,73 @@ class Engine:
                             await self.streaming_playback_manager.stop_streaming_playback(call_id)
                         except Exception:
                             pass
-                        return
+                        if stream_info:
+                            await self._finish_pipeline_stream_turn(lifecycle_turn, stream_info)
                     except Exception:
-                        logger.error("Pipeline streaming playback failed; falling back to file playback", call_id=call_id, exc_info=True)
+                        logger.error("Pipeline streaming playback failed", call_id=call_id, exc_info=True)
+                        if stream_info is not None:
+                            stream_info["end_reason"] = "streaming-playback-error"
                         try:
                             await self.streaming_playback_manager.stop_streaming_playback(call_id)
                         except Exception:
                             logger.debug("Pipeline stop_streaming_playback failed", call_id=call_id, exc_info=True)
-                        # Fall back to file-based playback using existing behavior
-                        try:
-                            tts_bytes = bytearray()
-                            first_tts_ts = None
-                            async for tts_chunk in pipeline.tts_adapter.synthesize(call_id, response_text, pipeline.tts_options):
-                                if tts_chunk:
-                                    if first_tts_ts is None:
-                                        first_tts_ts = time.time()
-                                        turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
-                                        session.turn_latencies_ms.append(turn_latency_ms)
-                                        try:
-                                            if t_start is not None:
-                                                _TURN_STT_TO_TTS.labels(pipeline_label, provider_label).observe(max(0.0, first_tts_ts - t_start))
-                                        except Exception:
-                                            pass
-                                    tts_bytes.extend(tts_chunk)
-                            if tts_bytes:
-                                playback_id = await self.playback_manager.play_audio(call_id, bytes(tts_bytes), "pipeline-tts")
-                        except Exception:
-                            logger.debug("Pipeline file-playback fallback failed", call_id=call_id, exc_info=True)
-                            if not tool_calls:
-                                return
+                        emitted_real_audio = bool(
+                            stream_info
+                            and stream_info.get("first_real_emit_ts")
+                            and int(stream_info.get("real_tx_bytes", 0) or 0) > 0
+                        )
+                        if stream_info is not None:
+                            await self._finish_pipeline_stream_turn(lifecycle_turn, stream_info)
+
+                        if emitted_real_audio:
+                            logger.warning(
+                                "Pipeline file fallback suppressed after real audio emission",
+                                call_id=call_id,
+                                emitted_bytes=int(stream_info.get("real_tx_bytes", 0) or 0),
+                            )
+                        else:
+                            lifecycle_turn.reset_ai_attempt()
+                            lifecycle_turn.mark_ai_generated(response_text)
+                            logger.info(
+                                "Pipeline streaming failed before audio emission; using file fallback",
+                                call_id=call_id,
+                            )
+                            try:
+                                tts_bytes = bytearray()
+                                first_tts_ts = None
+                                self._ensure_pipeline_call_active(call_id)
+                                async for tts_chunk in pipeline.tts_adapter.synthesize(call_id, response_text, pipeline.tts_options):
+                                    self._ensure_pipeline_call_active(call_id)
+                                    if tts_chunk:
+                                        if first_tts_ts is None:
+                                            first_tts_ts = time.time()
+                                            turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
+                                            session.turn_latencies_ms.append(turn_latency_ms)
+                                            try:
+                                                if t_start is not None:
+                                                    _TURN_STT_TO_TTS.labels(pipeline_label, provider_label).observe(max(0.0, first_tts_ts - t_start))
+                                            except Exception:
+                                                pass
+                                        tts_bytes.extend(tts_chunk)
+                                if tts_bytes:
+                                    playback_id = await self.playback_manager.play_audio(call_id, bytes(tts_bytes), "pipeline-tts")
+                                    if playback_id:
+                                        lifecycle_turn.mark_ai_playing(playback_id, started_at=time.time())
+                                        await self._finish_pipeline_file_turn(
+                                            call_id,
+                                            lifecycle_turn,
+                                            playback_id,
+                                            audio_bytes=len(tts_bytes),
+                                        )
+                                    else:
+                                        lifecycle_turn.mark_failed("file_fallback_playback_failed")
+                                else:
+                                    lifecycle_turn.mark_failed("file_fallback_no_audio")
+                            except Exception:
+                                lifecycle_turn.mark_failed("file_fallback_failed")
+                                logger.debug("Pipeline file-playback fallback failed", call_id=call_id, exc_info=True)
+                                if not tool_calls:
+                                    return
                     finally:
                         try:
                             if old_provider_name is not None:
@@ -13394,11 +14012,13 @@ class Engine:
                     tts_bytes = bytearray()
                     first_tts_ts: Optional[float] = None
                     try:
+                        self._ensure_pipeline_call_active(call_id)
                         async for tts_chunk in pipeline.tts_adapter.synthesize(
                             call_id,
                             response_text,
                             pipeline.tts_options,
                         ):
+                            self._ensure_pipeline_call_active(call_id)
                             if tts_chunk:
                                 if first_tts_ts is None:
                                     first_tts_ts = time.time()
@@ -13413,48 +14033,76 @@ class Engine:
                                 tts_bytes.extend(tts_chunk)
                     except Exception:
                         logger.debug("TTS synth failed", call_id=call_id, exc_info=True)
+                        tts_bytes.clear()
+                        lifecycle_turn.mark_failed("tts_synthesis_failed")
                         # If TTS fails but we have tools, continue to tools
                         if not tool_calls:
                             return
 
                     if tts_bytes:
                         try:
+                            self._ensure_pipeline_call_active(call_id)
                             playback_id = await self.playback_manager.play_audio(
                                 call_id,
                                 bytes(tts_bytes),
                                 "pipeline-tts",
                             )
+                            if playback_id:
+                                lifecycle_turn.mark_ai_playing(playback_id, started_at=time.time())
+                                await self._finish_pipeline_file_turn(
+                                    call_id,
+                                    lifecycle_turn,
+                                    playback_id,
+                                    audio_bytes=len(tts_bytes),
+                                )
                             try:
                                 if playback_id and t_start is not None:
                                     _TURN_RESPONSE_SECONDS.labels(pipeline_label, provider_label).observe(max(0.0, time.time() - t_start))
                             except Exception:
                                 pass
                             if not playback_id:
+                                lifecycle_turn.mark_failed("playback_failed")
                                 logger.error(
                                     "Pipeline playback failed",
                                     call_id=call_id,
                                     size=len(tts_bytes),
                                 )
                         except Exception:
+                            lifecycle_turn.mark_failed("playback_exception")
                             logger.error("Pipeline playback exception", call_id=call_id, exc_info=True)
+                    elif lifecycle_turn.state is not TurnLifecycleState.FAILED:
+                        lifecycle_turn.mark_failed("tts_no_audio")
+
+            if response_text and not _streaming_handled and lifecycle_turn.state in {
+                TurnLifecycleState.COMPLETED,
+                TurnLifecycleState.INTERRUPTED,
+            }:
+                try:
+                    await self._publish_pipeline_assistant_turn(call_id, lifecycle_turn)
+                    voiceai_assistant_published = bool(lifecycle_turn.audible_text)
+                except Exception:
+                    logger.debug(
+                        "Local pipeline assistant transcript publish failed",
+                        call_id=call_id,
+                        exc_info=True,
+                    )
+                if lifecycle_turn.audible_text:
+                    conversation_history.append(
+                        _ts_msg(
+                            "assistant",
+                            lifecycle_turn.audible_text,
+                            turn_id=lifecycle_turn.turn_id,
+                            lifecycle_state=lifecycle_turn.state.value,
+                        )
+                    )
+                    session.conversation_history = list(conversation_history)
+                    await self.session_store.upsert_call(session)
+                if lifecycle_turn.state is TurnLifecycleState.INTERRUPTED:
+                    return
 
             # 2. Execute Tools (if any)
             if tool_calls:
-                # Wait for playback to finish before executing tools (especially transfer/hangup)
-                if playback_id:
-                    try:
-                        # Best effort wait to let user hear the response
-                        await asyncio.sleep(len(response_text) * 0.08)
-                    except Exception:
-                        pass
-                elif _streaming_handled and response_text:
-                    try:
-                        # Streaming path played audio without setting playback_id;
-                        # estimate wait from response length so caller hears farewell
-                        await asyncio.sleep(len(response_text) * 0.08)
-                    except Exception:
-                        pass
-
+                self._ensure_pipeline_call_active(call_id)
                 from src.tools.context import ToolExecutionContext
                 from src.tools.registry import tool_registry
 
@@ -13474,6 +14122,7 @@ class Engine:
                 )
 
                 for tool_call in tool_calls:
+                    self._ensure_pipeline_call_active(call_id)
                     try:
                         name = tool_call.get("name")
                         args = tool_call.get("parameters") or {}
@@ -13593,6 +14242,7 @@ class Engine:
 
                                 # Trigger LLM to generate follow-up response
                                 try:
+                                    self._ensure_pipeline_call_active(call_id)
                                     context_for_llm = {"prior_messages": _sanitize_for_llm(conversation_history)}
                                     llm_response = await pipeline.llm_adapter.generate(
                                         call_id,
@@ -13605,23 +14255,40 @@ class Engine:
                                         if getattr(llm_response, 'text', None):
                                             response_text = llm_response.text.strip()
                                             if response_text:
-                                                conversation_history.append(_ts_msg("assistant", response_text))
+                                                self._ensure_pipeline_call_active(call_id)
                                                 logger.info("LLM continuation response", preview=response_text[:80], call_id=call_id)
-
-                                                # Synthesize and play TTS
-                                                tts_bytes = bytearray()
-                                                async for chunk in pipeline.tts_adapter.synthesize(call_id, response_text, pipeline.tts_options):
-                                                    if chunk:
-                                                        tts_bytes.extend(chunk)
-                                                if tts_bytes:
-                                                    pid = await self.playback_manager.play_audio(call_id, bytes(tts_bytes), "pipeline-tts")
-                                                    duration_sec = len(tts_bytes) / 8000.0
-                                                    if pid:
-                                                        await self.playback_manager.wait_for_playback_end(
-                                                            call_id,
-                                                            pid,
-                                                            timeout_sec=(duration_sec + 3.0),
-                                                        )
+                                                if lifecycle_turn.state not in {
+                                                    TurnLifecycleState.COMPLETED,
+                                                    TurnLifecycleState.INTERRUPTED,
+                                                }:
+                                                    await self._play_pipeline_followup_turn(
+                                                        call_id,
+                                                        session,
+                                                        pipeline,
+                                                        lifecycle_turn,
+                                                        response_text,
+                                                        conversation_history,
+                                                    )
+                                                else:
+                                                    # A text+tool response already owns this turn's
+                                                    # assistant event. Keep the legacy continuation
+                                                    # path until follow-up events receive distinct IDs.
+                                                    conversation_history.append(_ts_msg("assistant", response_text))
+                                                    session.conversation_history = list(conversation_history)
+                                                    await self.session_store.upsert_call(session)
+                                                    tts_bytes = bytearray()
+                                                    async for chunk in pipeline.tts_adapter.synthesize(call_id, response_text, pipeline.tts_options):
+                                                        if chunk:
+                                                            tts_bytes.extend(chunk)
+                                                    if tts_bytes:
+                                                        pid = await self.playback_manager.play_audio(call_id, bytes(tts_bytes), "pipeline-tts")
+                                                        duration_sec = len(tts_bytes) / 8000.0
+                                                        if pid:
+                                                            await self.playback_manager.wait_for_playback_end(
+                                                                call_id,
+                                                                pid,
+                                                                timeout_sec=(duration_sec + 3.0),
+                                                            )
 
                                         # Handle tool calls (with or without text)
                                         if getattr(llm_response, 'tool_calls', None):
@@ -13723,6 +14390,8 @@ class Engine:
                 name=f"pipeline-audio-ingestion-{call_id}",
             )
             await self._play_pipeline_greeting(context)
+            if context.dialog_ready_event is not None:
+                context.dialog_ready_event.set()
             await ingestion_task
         except asyncio.CancelledError:
             raise

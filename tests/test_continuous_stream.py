@@ -87,3 +87,49 @@ async def test_mark_segment_boundary_increments_and_resets_attack():
     info = mgr.active_streams[call_id]
     assert info['segments_played'] == 1
     assert info.get('attack_bytes_remaining') == expected_attack
+
+
+@pytest.mark.asyncio
+async def test_active_stream_rejects_a_different_producer_queue():
+    mgr = make_manager()
+    call_id = "test-call-queue-owner"
+    original_queue = asyncio.Queue()
+    mgr.active_streams[call_id] = {
+        'stream_id': 'stream-owner',
+        'audio_queue': original_queue,
+    }
+
+    stream_id = await mgr.start_streaming_playback(call_id, asyncio.Queue())
+
+    assert stream_id is None
+
+
+@pytest.mark.asyncio
+async def test_first_real_audio_emit_timestamp_is_recorded_once(monkeypatch):
+    mgr = make_manager()
+    call_id = "test-call-first-emit"
+    stream_id = "stream:first-emit"
+    mgr.active_streams[call_id] = {
+        'stream_id': stream_id,
+        'frames_sent': 0,
+        'first_real_emit_ts': None,
+        'last_real_emit_ts': None,
+    }
+
+    async def gating_started(*_args, **_kwargs):
+        return True
+
+    async def send_ok(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr(mgr, "_ensure_deferred_gating_started", gating_started)
+    monkeypatch.setattr(mgr, "_send_audio_chunk", send_ok)
+
+    assert await mgr._emit_frame(call_id, stream_id, b"first", "ulaw", 8000, filler=False) == "sent"
+    first_timestamp = mgr.active_streams[call_id]["first_real_emit_ts"]
+    await asyncio.sleep(0.01)
+    assert await mgr._emit_frame(call_id, stream_id, b"second", "ulaw", 8000, filler=False) == "sent"
+
+    assert first_timestamp is not None
+    assert mgr.active_streams[call_id]["first_real_emit_ts"] == first_timestamp
+    assert mgr.active_streams[call_id]["last_real_emit_ts"] >= first_timestamp

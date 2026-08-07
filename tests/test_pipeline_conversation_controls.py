@@ -9,6 +9,7 @@ from src.config import BargeInConfig
 from src.core.models import CallSession
 from src.core.session_store import SessionStore
 from src.core.streaming_playback_manager import StreamingPlaybackManager
+from src.core.turn_lifecycle import TurnLifecycleState, TurnLifecycleTracker
 from src.engine import Engine
 
 
@@ -92,6 +93,42 @@ async def test_pipeline_transcript_settlement_combines_finals_before_one_commit(
 
     assert committed == ["啊，是的，是的。 是有什么事吗？"]
     assert engine._confirm_pipeline_barge_in_candidate.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_pipeline_transcript_settlement_drops_turn_when_call_terminates():
+    engine = Engine.__new__(Engine)
+    engine._pipeline_barge_in_candidates = {}
+    engine._pipeline_terminating_calls = set()
+    engine._confirm_pipeline_barge_in_candidate = AsyncMock(return_value=False)
+    transcript_queue = asyncio.Queue()
+
+    async def produce_transcripts():
+        await transcript_queue.put(
+            {
+                "text": "挂断前最后一句",
+                "is_final": True,
+                "is_partial": False,
+                "event_id": "late-final",
+            }
+        )
+        await asyncio.sleep(0.02)
+        engine._pipeline_terminating_calls.add("terminating-settlement-call")
+        await asyncio.sleep(0.04)
+        await transcript_queue.put(None)
+
+    producer = asyncio.create_task(produce_transcripts())
+    committed = [
+        text
+        async for text in engine._iter_settled_pipeline_transcripts(
+            "terminating-settlement-call",
+            transcript_queue,
+            settle_seconds=0.04,
+        )
+    ]
+    await producer
+
+    assert committed == []
 
 
 @pytest.mark.asyncio
@@ -488,6 +525,48 @@ async def test_pipeline_barge_candidate_confirms_only_after_valid_transcript(pla
 
 
 @pytest.mark.asyncio
+async def test_confirmed_barge_in_interrupts_active_lifecycle_turn():
+    call_id = "barge-lifecycle"
+    session_store = SessionStore()
+    session = CallSession(call_id=call_id, caller_channel_id=call_id, provider_name="pipeline")
+    session.media_rx_confirmed = True
+    await session_store.upsert_call(session)
+
+    tracker = TurnLifecycleTracker(call_id)
+    turn = tracker.commit_customer("please continue")
+    turn.mark_ai_generated("This response is currently audible.")
+    turn.mark_ai_playing("stream-1", started_at=10.0)
+
+    engine = Engine.__new__(Engine)
+    engine.session_store = session_store
+    engine._pipeline_turn_trackers = {call_id: tracker}
+    engine.strategy_session_manager = SimpleNamespace(mark_barge_in=lambda _call_id: None)
+    engine.streaming_playback_manager = SimpleNamespace(
+        active_streams={call_id: {"stream_id": "stream-1"}},
+        stop_streaming_playback=AsyncMock(return_value=True),
+    )
+    engine._provider_stream_queues = {}
+    engine._provider_stream_formats = {}
+    engine._provider_coalesce_buf = {}
+    engine.ari_client = SimpleNamespace(stop_playback=AsyncMock())
+    engine.conversation_coordinator = None
+    engine.config = SimpleNamespace(barge_in=SimpleNamespace(provider_output_suppress_ms=0))
+    engine._save_session = AsyncMock(side_effect=session_store.upsert_call)
+    engine._call_providers = {}
+
+    applied = await engine._apply_barge_in_action(
+        call_id,
+        source="talkdetect",
+        reason="confirmed_customer_transcript",
+    )
+
+    assert applied is True
+    assert turn.state is TurnLifecycleState.INTERRUPTED
+    assert turn.interruption_reason == "confirmed_customer_transcript"
+    engine.streaming_playback_manager.stop_streaming_playback.assert_awaited_once_with(call_id)
+
+
+@pytest.mark.asyncio
 async def test_pipeline_stream_enqueue_stops_when_playback_is_removed():
     engine = Engine.__new__(Engine)
     active = {"value": True}
@@ -631,6 +710,37 @@ async def test_transcript_event_id_is_preserved_in_publish_queue():
     event = engine._voiceai_transcript_queue.get_nowait()
     assert event["content"] == "同一条稳定后的客户话语"
     assert event["event_id"] == "event-call:user:fixed-id"
+
+
+@pytest.mark.asyncio
+async def test_transcript_lifecycle_metadata_is_preserved_in_publish_queue():
+    engine = Engine.__new__(Engine)
+    engine._voiceai_transcript_queue = asyncio.Queue()
+    engine._resolve_voiceai_transcript_sink = lambda _call_id: "http://voiceai-backend"
+
+    await engine._publish_transcript_to_voiceai(
+        "event-call",
+        "assistant",
+        "audible response",
+        "local_pipeline_agent",
+        event_id="event-call:turn:1:assistant",
+        turn_id="event-call:turn:1",
+        turn_index=1,
+        turn_role_order=1,
+        lifecycle_state="interrupted",
+        started_at="2026-08-05T08:00:01+00:00",
+        interrupted_at="2026-08-05T08:00:02+00:00",
+        playback_id="stream-1",
+        interruption_reason="confirmed_customer_transcript",
+        audible_text_complete=False,
+    )
+
+    event = engine._voiceai_transcript_queue.get_nowait()
+    assert event["turn_id"] == "event-call:turn:1"
+    assert event["turn_index"] == 1
+    assert event["turn_role_order"] == 1
+    assert event["lifecycle_state"] == "interrupted"
+    assert event["audible_text_complete"] is False
 
 
 def test_tool_farewell_does_not_replay_the_same_assistant_text():

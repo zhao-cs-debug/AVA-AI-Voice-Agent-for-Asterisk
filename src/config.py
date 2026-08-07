@@ -1038,7 +1038,11 @@ def _generate_default_pipeline(config_data: Dict[str, Any]) -> None:
     config_data.setdefault("active_pipeline", pipeline_name)
 
 
-def load_config(path: str = "config/ai-agent.yaml") -> AppConfig:
+def load_config(
+    path: str = "config/ai-agent.yaml",
+    *,
+    merge_external_contexts: bool = True,
+) -> AppConfig:
     """
     Load and validate configuration from YAML file.
     
@@ -1084,11 +1088,12 @@ def load_config(path: str = "config/ai-agent.yaml") -> AppConfig:
     inject_provider_api_keys(config_data)
 
     # Phase 2b: Merge external context YAML files (config/contexts/*.yaml)
-    try:
-        _merge_external_contexts(config_data)
-    except Exception as e:
-        # Non-fatal; log debug and continue with inline contexts only
-        logger.debug("External context merge failed", error=str(e))
+    if merge_external_contexts:
+        try:
+            _merge_external_contexts(config_data)
+        except Exception as e:
+            # Non-fatal; log debug and continue with inline contexts only
+            logger.debug("External context merge failed", error=str(e))
     
     # Phase 3: Apply default values
     apply_transport_defaults(config_data)

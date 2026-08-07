@@ -428,11 +428,21 @@ class StreamingPlaybackManager:
             stream_id if successful, None if failed
         """
         try:
-            # Reuse active stream if one already exists
+            # Reuse is only valid for the same producer queue. Returning an old
+            # stream ID for a new queue silently drops the next assistant turn.
             if self.is_stream_active(call_id):
-                existing = self.active_streams[call_id]['stream_id']
-                logger.debug("Streaming already active for call", call_id=call_id, stream_id=existing)
-                return existing
+                active = self.active_streams[call_id]
+                existing = active['stream_id']
+                if active.get("audio_queue") is audio_chunks:
+                    logger.debug("Streaming already active for call", call_id=call_id, stream_id=existing)
+                    return existing
+                logger.warning(
+                    "Refusing to attach a new producer queue to an active stream",
+                    call_id=call_id,
+                    stream_id=existing,
+                    playback_type=playback_type,
+                )
+                return None
 
             # Get session to determine target channel
             session = await self.session_store.get_by_call_id(call_id)
@@ -733,7 +743,9 @@ class StreamingPlaybackManager:
                 'target_format': resolved_target_format,
                 'target_sample_rate': resolved_target_rate,
                 'tx_bytes': 0,
+                'real_tx_bytes': 0,
                 'queued_bytes': 0,
+                'queued_target_total_bytes': 0,
                 'frames_sent': 0,
                 'underflow_events': 0,
                 'provider_bytes': 0,
@@ -749,7 +761,9 @@ class StreamingPlaybackManager:
                 'idle_ticks': 0,
                 'idle_cutoff_ticks': idle_cutoff_ticks,
                 'last_real_emit_ts': None,
+                'first_real_emit_ts': None,
                 'last_emit_was_filler': False,
+                'audio_queue': audio_chunks,
                 'gating_started': gating_started,
                 'gating_deferred': defer_gating,
                 'skip_gating': skip_gating,
@@ -859,7 +873,8 @@ class StreamingPlaybackManager:
                         logger.info("🎵 STREAMING PLAYBACK - End of stream", call_id=call_id, stream_id=stream_id)
                         try:
                             if call_id in self.active_streams:
-                                self.active_streams[call_id]['end_reason'] = 'end-of-stream'
+                                stream_info = self.active_streams[call_id]
+                                stream_info['end_reason'] = stream_info.get('end_reason') or 'end-of-stream'
                         except Exception:
                             pass
                         try:
@@ -967,6 +982,9 @@ class StreamingPlaybackManager:
                                 egress_bytes = len(chunk)
                             info['buffered_bytes'] = int(info.get('buffered_bytes', 0)) + egress_bytes
                             info['queued_bytes'] = int(info.get('queued_bytes', 0)) + len(chunk)
+                            info['queued_target_total_bytes'] = int(
+                                info.get('queued_target_total_bytes', 0) or 0
+                            ) + egress_bytes
                     except Exception:
                         pass
 
@@ -1507,7 +1525,10 @@ class StreamingPlaybackManager:
                 info['last_frame_ts'] = now
                 info['last_emit_was_filler'] = bool(filler)
                 if not filler:
+                    if info.get('first_real_emit_ts') is None:
+                        info['first_real_emit_ts'] = now
                     info['last_real_emit_ts'] = now
+                    info['real_tx_bytes'] = int(info.get('real_tx_bytes', 0) or 0) + len(frame)
                     info['idle_ticks'] = 0
             except Exception:
                 pass
