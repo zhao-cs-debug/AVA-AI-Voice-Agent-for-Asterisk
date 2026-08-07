@@ -5708,7 +5708,15 @@ class Engine:
     @staticmethod
     def _is_valid_customer_transcript(text: str) -> bool:
         normalized = (text or "").strip()
-        return bool(normalized and any(char.isalnum() for char in normalized))
+        semantic = "".join(char.casefold() for char in normalized if char.isalnum())
+        if not semantic:
+            return False
+        # Alibaba ASR can finalize a hesitation as a standalone item. It is
+        # useful as source activity, but it is not enough customer intent to
+        # interrupt an answer or start a new LLM turn.
+        if re.fullmatch(r"[呃额]+", semantic):
+            return False
+        return semantic not in {"uh", "um", "erm", "hm", "hmm", "oh"}
 
     @staticmethod
     def _merge_pipeline_transcript_segment(current: str, incoming: str) -> str:
@@ -5888,11 +5896,18 @@ class Engine:
 
         previous_capture_enabled = bool(session.audio_capture_enabled)
         session.audio_capture_enabled = True
+        cfg = getattr(self.config, "barge_in", None)
+        timeout_ms = max(
+            100,
+            int(getattr(cfg, "talk_detect_transcript_confirmation_timeout_ms", 1200) or 1200),
+        )
         candidate_state = {
             "stream_id": stream_id,
             "source": source,
             "started_at": time.time(),
             "previous_capture_enabled": previous_capture_enabled,
+            "timeout_ms": timeout_ms,
+            "deadline_monotonic": time.monotonic() + timeout_ms / 1000.0,
             "timeout_task": None,
         }
         candidates[call_id] = candidate_state
@@ -5912,16 +5927,18 @@ class Engine:
                 exc_info=True,
             )
 
-        cfg = getattr(self.config, "barge_in", None)
-        timeout_ms = max(
-            100,
-            int(getattr(cfg, "talk_detect_transcript_confirmation_timeout_ms", 1200) or 1200),
-        )
-
         async def expire_candidate() -> None:
             try:
-                await asyncio.sleep(timeout_ms / 1000.0)
-                await self._expire_pipeline_barge_in_candidate(call_id, stream_id)
+                while True:
+                    current = candidates.get(call_id)
+                    if not current or current.get("stream_id") != stream_id:
+                        return
+                    remaining = float(current.get("deadline_monotonic", 0.0)) - time.monotonic()
+                    if remaining > 0:
+                        await asyncio.sleep(remaining)
+                        continue
+                    await self._expire_pipeline_barge_in_candidate(call_id, stream_id)
+                    return
             except asyncio.CancelledError:
                 return
 
@@ -5936,6 +5953,18 @@ class Engine:
             source=source,
             timeout_ms=timeout_ms,
         )
+        return True
+
+    def _note_pipeline_barge_in_asr_activity(self, call_id: str, text: str) -> bool:
+        """Keep a candidate open while meaningful customer speech is still partial."""
+        if not self._is_valid_customer_transcript(text):
+            return False
+        state = getattr(self, "_pipeline_barge_in_candidates", {}).get(call_id)
+        if not state:
+            return False
+        timeout_ms = max(100, int(state.get("timeout_ms", 1200) or 1200))
+        state["deadline_monotonic"] = time.monotonic() + timeout_ms / 1000.0
+        state["last_meaningful_asr_activity_at"] = time.time()
         return True
 
     async def _enqueue_pipeline_stream_chunk(
@@ -7475,9 +7504,42 @@ class Engine:
 
             # CRITICAL FIX: Check for pipeline mode FIRST before routing to monolithic providers
             if self._pipeline_forced.get(caller_channel_id):
+                # AudioSocket inbound media is the caller side of the bridge. Keep
+                # streaming it to pipeline STT while TTS is gated so Alibaba ASR
+                # retains one continuous source timeline. Playback interruption is
+                # still controlled separately by TalkDetect plus final transcripts.
+                q = self._pipeline_queues.get(caller_channel_id)
+                if q:
+                    try:
+                        pcm16 = pcm_bytes
+                        if pcm16 and pcm_rate != 16000:
+                            try:
+                                state = self._resample_state_pipeline16k.get(caller_channel_id)
+                                pcm16, state = resample_audio(pcm16, pcm_rate, 16000, state=state)
+                                self._resample_state_pipeline16k[caller_channel_id] = state
+                            except (TypeError, ValueError, IndexError):
+                                pcm16 = pcm_bytes
+                        if pcm16:
+                            q.put_nowait(pcm16)
+                            try:
+                                await self._publish_audio_to_voiceai(
+                                    caller_channel_id,
+                                    pcm16,
+                                    role="user",
+                                    encoding="slin",
+                                    sample_rate=16000,
+                                )
+                            except Exception:
+                                logger.debug("VoiceAI user audio publish failed (AudioSocket/pipeline)", call_id=caller_channel_id, exc_info=True)
+                    except asyncio.QueueFull:
+                        logger.debug("Pipeline queue full; dropping AudioSocket frame", call_id=caller_channel_id)
+                else:
+                    logger.warning("Pipeline mode active but no queue found (AudioSocket)", call_id=caller_channel_id)
+
                 # AAVA-28: Check gating to prevent agent from hearing its own TTS output
                 if not session.audio_capture_enabled:
-                    # Pipelines: allow barge-in detection during TTS gating, but do not forward audio until triggered.
+                    # Keep ASR full-duplex above, while playback remains gated until
+                    # TalkDetect plus a meaningful final confirms the interruption.
                     cfg = getattr(self.config, "barge_in", None)
                     if not cfg or not getattr(cfg, "enabled", True):
                         return
@@ -7580,34 +7642,7 @@ class Engine:
                             except Exception:
                                 pass
                         return
-                
-                q = self._pipeline_queues.get(caller_channel_id)
-                if q:
-                    try:
-                        pcm16 = pcm_bytes
-                        if pcm16 and pcm_rate != 16000:
-                            try:
-                                state = self._resample_state_pipeline16k.get(caller_channel_id)
-                                pcm16, state = resample_audio(pcm16, pcm_rate, 16000, state=state)
-                                self._resample_state_pipeline16k[caller_channel_id] = state
-                            except (TypeError, ValueError, IndexError):
-                                pcm16 = pcm_bytes
-                        if pcm16:
-                            q.put_nowait(pcm16)
-                            try:
-                                await self._publish_audio_to_voiceai(
-                                    caller_channel_id,
-                                    pcm16,
-                                    role="user",
-                                    encoding="slin",
-                                    sample_rate=16000,
-                                )
-                            except Exception:
-                                logger.debug("VoiceAI user audio publish failed (AudioSocket/pipeline)", call_id=caller_channel_id, exc_info=True)
-                        return
-                    except asyncio.QueueFull:
-                        logger.debug("Pipeline queue full; dropping AudioSocket frame", call_id=caller_channel_id)
-                        return
+                return
 
             # Unconditional continuous-input forward: Deepgram/OpenAI Realtime expect raw audio flow
             # NOTE: Only applies to monolithic providers, not pipelines (handled above)
@@ -8964,8 +8999,45 @@ class Engine:
         stream_info: Dict[str, Any],
     ) -> str:
         streaming_task = stream_info.get("streaming_task")
+        end_reason = str(stream_info.get("end_reason") or "end-of-stream")
+        interrupted_hint = bool(
+            turn.state is TurnLifecycleState.INTERRUPTED
+            or stream_info.get("stop_requested")
+            or end_reason != "end-of-stream"
+        )
         if streaming_task and streaming_task is not asyncio.current_task() and not streaming_task.done():
-            await asyncio.gather(streaming_task, return_exceptions=True)
+            if interrupted_hint:
+                timeout_sec = max(
+                    0.01,
+                    float(getattr(self, "_pipeline_stream_finish_timeout_sec", 0.5) or 0.5),
+                )
+                _, pending = await asyncio.wait({streaming_task}, timeout=timeout_sec)
+                if pending:
+                    logger.warning(
+                        "Interrupted pipeline producer did not settle before lifecycle finalization",
+                        call_id=turn.call_id,
+                        turn_id=turn.turn_id,
+                        end_reason=end_reason,
+                        timeout_sec=timeout_sec,
+                    )
+                    streaming_task.cancel()
+                    _, pending = await asyncio.wait(
+                        {streaming_task},
+                        timeout=min(0.1, timeout_sec),
+                    )
+                    if pending:
+                        logger.error(
+                            "Interrupted pipeline producer remained pending after cancellation",
+                            call_id=turn.call_id,
+                            turn_id=turn.turn_id,
+                            end_reason=end_reason,
+                        )
+                if streaming_task.done():
+                    await asyncio.gather(streaming_task, return_exceptions=True)
+            else:
+                # A natural EOS must keep waiting for physical playback so a
+                # complete answer is never truncated by the defensive timeout.
+                await asyncio.gather(streaming_task, return_exceptions=True)
 
         emitted_bytes = int(
             stream_info.get("real_tx_bytes", stream_info.get("tx_bytes", 0)) or 0
@@ -8978,7 +9050,6 @@ class Engine:
         )
         first_emit = stream_info.get("first_real_emit_ts")
         last_emit = stream_info.get("last_real_emit_ts")
-        end_reason = str(stream_info.get("end_reason") or "end-of-stream")
         completed_end_reasons = {"end-of-stream"}
         interrupted = (
             turn.state is TurnLifecycleState.INTERRUPTED
@@ -13103,6 +13174,11 @@ class Engine:
                     async for transcript_event in results:
                         try:
                             normalized_event = self._normalize_pipeline_transcript_event(transcript_event)
+                            if normalized_event["is_partial"]:
+                                self._note_pipeline_barge_in_asr_activity(
+                                    call_id,
+                                    normalized_event["text"],
+                                )
                             is_final = bool(normalized_event["is_final"] and not normalized_event["is_partial"])
                             if is_final:
                                 self._last_transcript_ts[call_id] = time.time()
@@ -13174,6 +13250,44 @@ class Engine:
                 ingest_task.cancel()
                 stt_task.cancel()
                 await asyncio.gather(ingest_task, stt_task, return_exceptions=True)
+
+    async def _process_pipeline_dialog_turns(
+        self,
+        call_id: str,
+        transcript_queue: asyncio.Queue,
+        *,
+        settle_seconds: float,
+        run_turn: Callable[[str], Any],
+    ) -> None:
+        """Settle ASR continuously while executing committed turns sequentially."""
+        committed_queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
+
+        async def collect_committed_turns() -> None:
+            try:
+                async for committed in self._iter_settled_pipeline_transcripts(
+                    call_id,
+                    transcript_queue,
+                    settle_seconds=settle_seconds,
+                ):
+                    await committed_queue.put(committed)
+            finally:
+                await committed_queue.put(None)
+
+        collector_task = asyncio.create_task(
+            collect_committed_turns(),
+            name=f"pipeline-turn-settlement-{call_id}",
+        )
+        try:
+            while True:
+                committed = await committed_queue.get()
+                if committed is None:
+                    break
+                await run_turn(committed)
+            await collector_task
+        finally:
+            if not collector_task.done():
+                collector_task.cancel()
+                await asyncio.gather(collector_task, return_exceptions=True)
 
     async def _run_pipeline_dialog(self, context: PipelineRunnerContext) -> None:
         call_id = context.call_id
@@ -14360,12 +14474,12 @@ class Engine:
                         logger.error("Tool execution failed", tool=name, error=str(e), exc_info=True)
 
         try:
-            async for committed in self._iter_settled_pipeline_transcripts(
+            await self._process_pipeline_dialog_turns(
                 call_id,
                 transcript_queue,
                 settle_seconds=max(0.0, settle_seconds),
-            ):
-                await run_turn(committed)
+                run_turn=run_turn,
+            )
         except asyncio.CancelledError:
             pass
 

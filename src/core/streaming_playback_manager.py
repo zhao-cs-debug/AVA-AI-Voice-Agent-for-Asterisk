@@ -1013,6 +1013,29 @@ class StreamingPlaybackManager:
                         pass
                     continue
         finally:
+            current_task = asyncio.current_task()
+            cancelling = bool(
+                current_task
+                and getattr(current_task, "cancelling", lambda: 0)()
+            )
+            stream_info = self.active_streams.get(call_id)
+            externally_stopped = bool(
+                cancelling
+                and stream_info is not None
+                and stream_info.get("stop_requested")
+            )
+            if externally_stopped:
+                # stop_streaming_playback owns cleanup after an explicit abort.
+                # The producer can be cancelled while blocked on a full jitter
+                # queue, so any await here could outlive the stop timeout.
+                stream_info["producer_closed"] = True
+                logger.debug(
+                    "Streaming producer yielded cleanup to stop owner",
+                    call_id=call_id,
+                    stream_id=stream_id,
+                )
+                raise asyncio.CancelledError
+
             # Flush any pending byte counters on all exit paths (M9 fix)
             if bytes_since_last_upsert > 0:
                 try:
@@ -1025,8 +1048,15 @@ class StreamingPlaybackManager:
                     logger.debug("Failed to flush pending byte counters on exit", call_id=call_id, exc_info=True)
                 bytes_since_last_upsert = 0
             if not sentinel_sent:
-                with suppress(asyncio.CancelledError, Exception):
-                    await jitter_buffer.put(_JITTER_SENTINEL)
+                # A cancelled producer cannot assume the pacer still drains the
+                # bounded queue. Natural EOS keeps the blocking put so queued
+                # audio remains ordered before the sentinel.
+                if cancelling:
+                    with suppress(asyncio.QueueFull):
+                        jitter_buffer.put_nowait(_JITTER_SENTINEL)
+                else:
+                    with suppress(asyncio.CancelledError, Exception):
+                        await jitter_buffer.put(_JITTER_SENTINEL)
                 sentinel_sent = True
             pacer_task: Optional[asyncio.Task] = None
             stream_info = self.active_streams.get(call_id)
@@ -3412,6 +3442,25 @@ class StreamingPlaybackManager:
                             stop_waiter.cancel()
                             with suppress(asyncio.CancelledError):
                                 await stop_waiter
+
+            # The caller owns cleanup from this point. Set this before task
+            # cancellation so the producer's finally block cannot duplicate
+            # slow async cleanup or block on a full jitter queue.
+            stream_info['stop_requested'] = True
+
+            # An aborted answer must discard audio that has not reached the
+            # caller. Draining first also releases a producer blocked on put().
+            if not drain:
+                jitter_buffer = self.jitter_buffers.get(call_id)
+                if jitter_buffer is not None:
+                    while True:
+                        try:
+                            jitter_buffer.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                    stream_info['buffered_bytes'] = 0
+                    stream_info['jitter_depth'] = 0
+                self.frame_remainders.pop(call_id, None)
 
             cancelled_tasks = []
             seen_tasks = set()

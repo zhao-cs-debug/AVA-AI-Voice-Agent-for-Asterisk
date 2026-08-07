@@ -17,6 +17,56 @@ class _DummyARI:
     pass
 
 
+@pytest.mark.parametrize("text", ["呃。", "额……", "Uh.", "um", "Oh."])
+def test_customer_transcript_rejects_hesitation_only_final(text):
+    assert Engine._is_valid_customer_transcript(text) is False
+
+
+@pytest.mark.parametrize("text", ["嗯。", "是的", "等一下", "啊？"])
+def test_customer_transcript_keeps_meaningful_short_answer(text):
+    assert Engine._is_valid_customer_transcript(text) is True
+
+
+@pytest.mark.asyncio
+async def test_pipeline_settlement_drops_hesitation_before_llm_boundary():
+    engine = Engine.__new__(Engine)
+    engine._pipeline_barge_in_candidates = {}
+    engine._pipeline_terminating_calls = set()
+    engine._confirm_pipeline_barge_in_candidate = AsyncMock(return_value=False)
+    transcript_queue = asyncio.Queue()
+    await transcript_queue.put(
+        {
+            "text": "呃。",
+            "is_final": True,
+            "is_partial": False,
+            "event_id": "hesitation-only",
+        }
+    )
+    await transcript_queue.put(
+        {
+            "text": "可能是我最近失业了吧。",
+            "is_final": True,
+            "is_partial": False,
+            "event_id": "meaningful-answer",
+        }
+    )
+    await transcript_queue.put(None)
+
+    committed = [
+        text
+        async for text in engine._iter_settled_pipeline_transcripts(
+            "hesitation-filter-call",
+            transcript_queue,
+            settle_seconds=0.0,
+        )
+    ]
+
+    assert committed == ["可能是我最近失业了吧。"]
+    engine._confirm_pipeline_barge_in_candidate.assert_awaited_once_with(
+        "hesitation-filter-call", "可能是我最近失业了吧。"
+    )
+
+
 def test_greeting_protection_window_is_shared_by_native_provider_paths():
     engine = Engine.__new__(Engine)
     engine.config = SimpleNamespace(barge_in=BargeInConfig())
@@ -64,6 +114,53 @@ async def test_pipeline_greeting_blocks_talkdetect_for_three_seconds():
         session,
         source="talkdetect",
     )
+
+
+@pytest.mark.asyncio
+async def test_audiosocket_pipeline_keeps_streaming_stt_input_during_tts_gate():
+    call_id = "pipeline-full-duplex-stt"
+    conn_id = "audio-connection"
+    pcm16 = b"\x01\x00" * 320
+    session_store = SessionStore()
+    session = CallSession(call_id=call_id, caller_channel_id=call_id, provider_name="pipeline")
+    session.audio_capture_enabled = False
+    session.tts_playing = True
+    session.media_rx_confirmed = True
+    session.vad_state["pipeline_talk_detect"] = {"enabled": True}
+    await session_store.upsert_call(session)
+
+    pipeline_queue = asyncio.Queue()
+    engine = Engine.__new__(Engine)
+    engine.conn_to_channel = {conn_id: call_id}
+    engine.audio_socket_server = None
+    engine._audiosocket_frame_count = {}
+    engine.session_store = session_store
+    engine.config = SimpleNamespace(
+        audio_transport="audiosocket",
+        audiosocket=SimpleNamespace(format="slin16", sample_rate=16000),
+        streaming=SimpleNamespace(sample_rate=16000),
+        barge_in=SimpleNamespace(enabled=True),
+    )
+    engine._save_session = AsyncMock(side_effect=session_store.upsert_call)
+    engine._infer_transport_from_frame = lambda _size: ("slin16", 16000)
+    engine._update_transport_profile = AsyncMock()
+    engine._wire_to_pcm16 = lambda payload, *_args: (payload, 16000)
+    engine._update_audio_diagnostics = lambda *_args: None
+    engine.audio_capture = SimpleNamespace(append_pcm16=lambda *_args, **_kwargs: None)
+    engine.customer_audio_capture = SimpleNamespace(
+        append_pcm16=lambda *_args, **_kwargs: False
+    )
+    engine._consume_attended_transfer_screening_audio = lambda *_args: False
+    engine._session_has_pending_attended_transfer = lambda *_args: False
+    engine._pipeline_forced = {call_id: True}
+    engine._pipeline_queues = {call_id: pipeline_queue}
+    engine._resample_state_pipeline16k = {}
+    engine._publish_audio_to_voiceai = AsyncMock()
+
+    await engine._audiosocket_handle_audio(conn_id, pcm16)
+
+    assert pipeline_queue.get_nowait() == pcm16
+    assert session.audio_capture_enabled is False
 
 
 @pytest.mark.asyncio
@@ -281,6 +378,47 @@ async def test_pipeline_transcript_settlement_keeps_repeated_text_in_separate_tu
     await producer
 
     assert committed == ["嗯。", "嗯。"]
+
+
+@pytest.mark.asyncio
+async def test_pipeline_dialog_settles_new_speech_while_previous_turn_runs():
+    engine = Engine.__new__(Engine)
+    engine._pipeline_barge_in_candidates = {}
+    engine._pipeline_terminating_calls = set()
+    engine._confirm_pipeline_barge_in_candidate = AsyncMock(return_value=False)
+    transcript_queue = asyncio.Queue()
+    first_turn_started = asyncio.Event()
+    release_first_turn = asyncio.Event()
+    handled_turns = []
+
+    async def run_turn(text):
+        handled_turns.append(text)
+        if len(handled_turns) == 1:
+            first_turn_started.set()
+            await release_first_turn.wait()
+
+    dialog_task = asyncio.create_task(
+        engine._process_pipeline_dialog_turns(
+            "dialog-settlement-call",
+            transcript_queue,
+            settle_seconds=0.03,
+            run_turn=run_turn,
+        )
+    )
+    await transcript_queue.put("第一轮")
+    await asyncio.wait_for(first_turn_started.wait(), timeout=0.2)
+
+    await transcript_queue.put("第二轮")
+    await asyncio.sleep(0.05)
+    await transcript_queue.put("第三轮")
+    await asyncio.sleep(0.05)
+
+    assert transcript_queue.empty()
+    release_first_turn.set()
+    await transcript_queue.put(None)
+    await asyncio.wait_for(dialog_task, timeout=0.3)
+
+    assert handled_turns == ["第一轮", "第二轮", "第三轮"]
 
 
 @pytest.mark.asyncio
@@ -521,6 +659,43 @@ async def test_pipeline_barge_candidate_confirms_only_after_valid_transcript(pla
         source="talkdetect",
         reason="confirmed_customer_transcript",
     )
+    engine.streaming_playback_manager.resume_streaming_playback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_meaningful_asr_partial_keeps_barge_candidate_open_for_final():
+    call_id = "candidate-partial-extension"
+    session_store = SessionStore()
+    session = CallSession(call_id=call_id, caller_channel_id=call_id, provider_name="pipeline")
+    session.audio_capture_enabled = False
+    session.media_rx_confirmed = True
+    await session_store.upsert_call(session)
+
+    engine = Engine.__new__(Engine)
+    engine.session_store = session_store
+    engine._pipeline_barge_in_candidates = {}
+    engine.streaming_playback_manager = SimpleNamespace(
+        active_streams={
+            call_id: {"stream_id": "stream-1", "playback_type": "pipeline-tts"}
+        },
+        pause_streaming_playback=AsyncMock(return_value=True),
+        resume_streaming_playback=AsyncMock(return_value=True),
+    )
+    engine.config = SimpleNamespace(
+        barge_in=SimpleNamespace(talk_detect_transcript_confirmation_timeout_ms=40)
+    )
+    engine._save_session = AsyncMock(side_effect=session_store.upsert_call)
+    engine._apply_barge_in_action = AsyncMock(return_value=True)
+
+    assert await engine._start_pipeline_barge_in_candidate(session, source="talkdetect") is True
+    await asyncio.sleep(0.06)
+    assert engine._note_pipeline_barge_in_asr_activity(call_id, "呃。") is False
+    assert engine._note_pipeline_barge_in_asr_activity(call_id, "我现在确实没有收入") is True
+    await asyncio.sleep(0.06)
+
+    assert call_id in engine._pipeline_barge_in_candidates
+    assert await engine._confirm_pipeline_barge_in_candidate(call_id, "我现在确实没有收入。") is True
+    engine._apply_barge_in_action.assert_awaited_once()
     engine.streaming_playback_manager.resume_streaming_playback.assert_not_awaited()
 
 

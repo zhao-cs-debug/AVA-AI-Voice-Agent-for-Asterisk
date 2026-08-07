@@ -133,3 +133,78 @@ async def test_first_real_audio_emit_timestamp_is_recorded_once(monkeypatch):
     assert first_timestamp is not None
     assert mgr.active_streams[call_id]["first_real_emit_ts"] == first_timestamp
     assert mgr.active_streams[call_id]["last_real_emit_ts"] >= first_timestamp
+
+
+@pytest.mark.asyncio
+async def test_stop_settles_all_tasks_when_paused_jitter_queue_is_full(monkeypatch):
+    mgr = make_manager(fallback_timeout_ms=10_000)
+    call_id = "test-call-stop-paused-full-jitter"
+    stream_id = "stream:resp:test-call-stop-paused-full-jitter:1"
+    audio_chunks = asyncio.Queue()
+    audio_chunks.put_nowait(b"new-provider-audio")
+
+    class ObservedQueue(asyncio.Queue):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.put_started = asyncio.Event()
+
+        async def put(self, item):
+            self.put_started.set()
+            await super().put(item)
+
+    jitter_buffer = ObservedQueue(maxsize=1)
+    jitter_buffer.put_nowait(b"queued-audio")
+    resume_event = asyncio.Event()
+
+    async def paused_pacer():
+        await resume_event.wait()
+        await asyncio.Event().wait()
+
+    async def keepalive():
+        await asyncio.Event().wait()
+
+    producer = asyncio.create_task(
+        mgr._stream_audio_loop(call_id, stream_id, audio_chunks, jitter_buffer)
+    )
+    pacer = asyncio.create_task(paused_pacer())
+    keepalive_task = asyncio.create_task(keepalive())
+    mgr.active_streams[call_id] = {
+        "stream_id": stream_id,
+        "streaming_task": producer,
+        "pacer_task": pacer,
+        "keepalive_task": keepalive_task,
+        "playback_resume_event": resume_event,
+        "stop_event": asyncio.Event(),
+        "end_reason": "barge-in",
+    }
+    mgr.jitter_buffers[call_id] = jitter_buffer
+    mgr.keepalive_tasks[call_id] = keepalive_task
+
+    async def cleanup(_call_id, _stream_id):
+        mgr.active_streams.pop(_call_id, None)
+        mgr.jitter_buffers.pop(_call_id, None)
+
+    monkeypatch.setattr(mgr, "_cleanup_stream", cleanup)
+    await asyncio.wait_for(jitter_buffer.put_started.wait(), timeout=0.2)
+    assert audio_chunks.empty()
+
+    stop_task = asyncio.create_task(mgr.stop_streaming_playback(call_id))
+    done, pending = await asyncio.wait({stop_task}, timeout=0.2)
+    try:
+        assert not pending
+        assert stop_task.result() is True
+        assert producer.done()
+        assert pacer.done()
+        assert keepalive_task.done()
+        assert jitter_buffer.empty()
+        assert call_id not in mgr.active_streams
+    finally:
+        while not jitter_buffer.empty():
+            jitter_buffer.get_nowait()
+        for task in (producer, pacer, keepalive_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(producer, pacer, keepalive_task, stop_task, return_exceptions=True),
+            timeout=1.0,
+        )

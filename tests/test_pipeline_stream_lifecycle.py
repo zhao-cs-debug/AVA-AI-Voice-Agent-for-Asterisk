@@ -233,3 +233,41 @@ async def test_transport_failure_is_interrupted_and_uses_comparable_audio_bytes(
     assert turn.interruption_reason == "transport-failure"
     assert turn.audible_text_complete is False
     assert audible == "abcde"
+
+
+@pytest.mark.asyncio
+async def test_stalled_interrupted_stream_cannot_block_the_next_customer_turn():
+    engine = Engine.__new__(Engine)
+    engine._pipeline_stream_finish_timeout_sec = 0.03
+    release = asyncio.Event()
+
+    async def stalled_producer():
+        await release.wait()
+
+    producer = asyncio.create_task(stalled_producer())
+    tracker = TurnLifecycleTracker("call-stalled-stream")
+    turn = tracker.commit_customer("first customer turn")
+    turn.mark_ai_generated("first sentence. second sentence.")
+    turn.mark_ai_playing("stream-stalled", started_at=20.0)
+    turn.mark_interrupted(reason="confirmed_customer_transcript", interrupted_at=21.0)
+    stream_info = {
+        "streaming_task": producer,
+        "first_real_emit_ts": 20.0,
+        "last_real_emit_ts": 21.0,
+        "real_tx_bytes": 4000,
+        "queued_target_total_bytes": 8000,
+        "end_reason": "barge-in",
+    }
+
+    finish_task = asyncio.create_task(
+        engine._finish_pipeline_stream_turn(turn, stream_info)
+    )
+    done, pending = await asyncio.wait({finish_task}, timeout=0.15)
+    try:
+        assert not pending
+        assert finish_task.result()
+        next_turn = tracker.commit_customer("next customer turn")
+        assert next_turn.customer_text == "next customer turn"
+    finally:
+        release.set()
+        await asyncio.gather(producer, finish_task, return_exceptions=True)
