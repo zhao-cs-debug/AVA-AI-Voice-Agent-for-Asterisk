@@ -48,6 +48,7 @@ class ExternalStrategyAgentProvider(AIProviderInterface, ProviderCapabilitiesMix
         self._send_lock = asyncio.Lock()
         self._call_id: Optional[str] = None
         self._session_id: Optional[str] = None
+        self._last_worker_id = ""
         self._connected = False
         self._closing = False
         self._remote_ended = False
@@ -99,6 +100,7 @@ class ExternalStrategyAgentProvider(AIProviderInterface, ProviderCapabilitiesMix
         if on_event:
             self.on_event = on_event
         await self._reset_session(call_id)
+        await self._check_service_health()
         external = self._validated_context(context or {})
         audio = external["audio"]
         self._input_rate = int(audio["input_sample_rate"])
@@ -126,8 +128,15 @@ class ExternalStrategyAgentProvider(AIProviderInterface, ProviderCapabilitiesMix
                 },
             )
             self._session_id = self._required_string(created, "session_id")
-            settings_url = self._required_string(created, "settings_url")
-            websocket_path = self._required_string(created, "websocket_path")
+            owner_worker_id = self._last_worker_id
+            settings_url = str(
+                created.get("settings_url")
+                or f"/api/v1/external/sessions/{self._session_id}/settings"
+            ).strip()
+            websocket_path = str(
+                created.get("websocket_path")
+                or f"/api/v1/external/sessions/{self._session_id}/stream"
+            ).strip()
 
             confirmed = await self._request_json(
                 "PUT",
@@ -139,13 +148,15 @@ class ExternalStrategyAgentProvider(AIProviderInterface, ProviderCapabilitiesMix
                 raise ExternalStrategyProtocolError("External strategy settings were not confirmed")
             confirmed_settings = confirmed.get("settings")
             if not isinstance(confirmed_settings, dict):
-                raise ExternalStrategyProtocolError("Settings confirmation omitted the complete settings object")
+                confirmed_settings = {}
             websocket_path = str(confirmed.get("websocket_path") or websocket_path).strip()
+            self._require_same_worker(owner_worker_id, self._last_worker_id, "settings confirmation")
 
             catalog = await self._request_json(
                 "GET",
                 f"/api/tts/voices?conn_id={quote(self._session_id, safe='')}",
             )
+            self._require_same_worker(owner_worker_id, self._last_worker_id, "voice list lookup")
             selection = self._select_voice(
                 catalog,
                 external.get("voice") or {},
@@ -165,6 +176,7 @@ class ExternalStrategyAgentProvider(AIProviderInterface, ProviderCapabilitiesMix
                     persisted.get(selection["value_field"]) or ""
                 ) != selection["value"]:
                     raise ExternalStrategyProtocolError("External strategy service did not persist the selected voice")
+                self._require_same_worker(owner_worker_id, self._last_worker_id, "voice settings save")
 
             websocket_url = self._websocket_url(websocket_path)
             self._ws = await self._connect_websocket(websocket_url)
@@ -253,6 +265,7 @@ class ExternalStrategyAgentProvider(AIProviderInterface, ProviderCapabilitiesMix
             await self._close_resources(send_end=False)
         self._call_id = call_id
         self._session_id = None
+        self._last_worker_id = ""
         self._closing = False
         self._connected = False
         self._remote_ended = False
@@ -286,6 +299,7 @@ class ExternalStrategyAgentProvider(AIProviderInterface, ProviderCapabilitiesMix
                 timeout=aiohttp.ClientTimeout(total=timeout or self.config.request_timeout_sec),
                 allow_redirects=False,
             ) as response:
+                self._last_worker_id = str(response.headers.get("X-Service-Worker-Id") or "").strip()
                 raw = await response.text()
                 if response.status >= 400:
                     raise ExternalStrategyProtocolError(
@@ -302,6 +316,22 @@ class ExternalStrategyAgentProvider(AIProviderInterface, ProviderCapabilitiesMix
         if not isinstance(decoded, dict):
             raise ExternalStrategyProtocolError("External strategy response must be an object")
         return decoded
+
+    async def _check_service_health(self) -> None:
+        health = await self._request_json(
+            "GET",
+            "/__service/health",
+            timeout=min(float(self.config.request_timeout_sec), 30.0),
+        )
+        if health.get("ok") is not True:
+            raise ExternalStrategyProtocolError("External strategy service is not healthy")
+
+    @staticmethod
+    def _require_same_worker(expected: str, actual: str, operation: str) -> None:
+        if expected and actual and expected != actual:
+            raise ExternalStrategyProtocolError(
+                f"External strategy worker affinity lost during {operation}"
+            )
 
     async def _http_session(self) -> aiohttp.ClientSession:
         if self._http is None or self._http.closed:
@@ -691,37 +721,51 @@ class ExternalStrategyAgentProvider(AIProviderInterface, ProviderCapabilitiesMix
         frame_bytes = int(input_rate * 2 * chunk_ms / 1000)
         if frame_bytes > MAX_INPUT_FRAME_BYTES:
             raise ValueError("External strategy audio chunk exceeds the 256 KiB frame limit")
-        normalized = dict(external)
-        normalized["network"] = dict(network)
-        normalized["ai"] = dict(ai)
-        normalized["human"] = dict(human)
-        normalized["audio"] = {
-            "input_sample_rate": input_rate,
-            "output_sample_rate": output_rate,
-            "chunk_ms": chunk_ms,
+        voice = external.get("voice") if isinstance(external.get("voice"), dict) else {}
+        return {
+            "network": {
+                "external_id": str(network.get("external_id") or "").strip(),
+            },
+            "ai": {
+                "title": str(ai.get("title") or "").strip(),
+                "gender": str(ai.get("gender") or "").strip(),
+                "background": str(ai.get("background") or "").strip(),
+            },
+            "human": {
+                "title": str(human.get("title") or "").strip(),
+                "gender": str(human.get("gender") or "").strip(),
+                "background": str(human.get("background") or "").strip(),
+            },
+            "voice": {
+                "value": str(voice.get("value") or "").strip(),
+            },
+            "audio": {
+                "input_sample_rate": input_rate,
+                "output_sample_rate": output_rate,
+                "chunk_ms": chunk_ms,
+            },
         }
-        return normalized
 
     def _settings_payload(self, external: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+        del context
+        ai = dict(external.get("ai") or {})
         human = dict(external.get("human") or {})
-        template = str(human.pop("background_template", "") or human.get("background") or "")
-        if template:
-            values = {
-                "caller_name": str(context.get("caller_name") or ""),
-                "caller_id": str(context.get("caller_id") or ""),
-            }
-            try:
-                human["background"] = template.format(**values)
-            except (KeyError, ValueError):
-                human["background"] = template
         return {
             "confirm": True,
             "network": {
                 "mode": "existing",
                 "id": str(external["network"]["external_id"]).strip(),
             },
-            "ai": dict(external["ai"]),
-            "human": human,
+            "ai": {
+                "title": str(ai.get("title") or "").strip(),
+                "gender": str(ai.get("gender") or "").strip(),
+                "background": str(ai.get("background") or "").strip(),
+            },
+            "human": {
+                "title": str(human.get("title") or "").strip(),
+                "gender": str(human.get("gender") or "").strip(),
+                "background": str(human.get("background") or "").strip(),
+            },
         }
 
     @staticmethod

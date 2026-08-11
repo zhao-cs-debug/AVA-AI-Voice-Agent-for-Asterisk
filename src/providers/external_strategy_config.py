@@ -27,7 +27,7 @@ class ExternalStrategyAgentConfig:
     request_timeout_sec: float = 30.0
     settings_timeout_sec: float = 600.0
     session_start_timeout_sec: float = 120.0
-    close_timeout_sec: float = 2.0
+    close_timeout_sec: float = 10.0
     max_message_bytes: int = 2 * 1024 * 1024
     continuous_input: bool = True
 

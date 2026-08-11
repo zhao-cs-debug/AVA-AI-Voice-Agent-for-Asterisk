@@ -62,7 +62,7 @@ def provider_context(**overrides):
     external_strategy = {
         "network": {"asset_id": 3, "external_id": "network-016"},
         "ai": {"title": "AI顾问", "gender": "女", "background": "负责核实客户需求"},
-        "human": {"title": "客户", "gender": "", "background_template": "客户姓名：{caller_name}"},
+        "human": {"title": "客户", "gender": "", "background": "客户背景"},
         "voice": {"value_field": "legacy_field", "value": "voice-2", "label": "女声二"},
         "audio": {"input_sample_rate": 16000, "output_sample_rate": 24000, "chunk_ms": 200},
     }
@@ -90,6 +90,79 @@ def test_context_rejects_audio_frame_larger_than_documented_limit():
         }))
 
 
+def test_validated_context_keeps_only_demo_runtime_fields():
+    provider = ExternalStrategyAgentProvider(provider_config(), AsyncMock())
+    context = provider_context()
+    context["external_strategy"].update({
+        "greeting": "local greeting must not survive",
+        "prompt": "local prompt must not survive",
+        "tools": ["local-tool"],
+        "knowledge_bindings": {"enabled": True},
+        "background_music": "local-moh",
+    })
+
+    normalized = provider._validated_context(context)
+
+    assert normalized == {
+        "network": {"external_id": "network-016"},
+        "ai": {
+            "title": "AI顾问",
+            "gender": "女",
+            "background": "负责核实客户需求",
+        },
+        "human": {
+            "title": "客户",
+            "gender": "",
+            "background": "客户背景",
+        },
+        "voice": {"value": "voice-2"},
+        "audio": {
+            "input_sample_rate": 16000,
+            "output_sample_rate": 24000,
+            "chunk_ms": 200,
+        },
+    }
+
+
+def test_settings_payload_matches_demo_persona_shape_and_ignores_local_fields():
+    provider = ExternalStrategyAgentProvider(provider_config(), AsyncMock())
+
+    payload = provider._settings_payload(
+        {
+            "network": {"external_id": "network-1"},
+            "ai": {
+                "title": "AI顾问",
+                "gender": "女",
+                "background": "负责售后咨询",
+                "greeting": "local greeting must be ignored",
+                "prompt": "local prompt must be ignored",
+            },
+            "human": {
+                "title": "客户",
+                "gender": "",
+                "background": "客户背景",
+                "background_template": "local template must be ignored",
+            },
+        },
+        {"caller_name": "张女士"},
+    )
+
+    assert payload == {
+        "confirm": True,
+        "network": {"mode": "existing", "id": "network-1"},
+        "ai": {
+            "title": "AI顾问",
+            "gender": "女",
+            "background": "负责售后咨询",
+        },
+        "human": {
+            "title": "客户",
+            "gender": "",
+            "background": "客户背景",
+        },
+    }
+
+
 @pytest.mark.asyncio
 async def test_unauthenticated_http_session_omits_empty_authorization_header():
     provider = ExternalStrategyAgentProvider(
@@ -114,6 +187,7 @@ async def test_start_session_runs_full_http_lifecycle_and_uses_returned_worker_u
 
     provider = ExternalStrategyAgentProvider(provider_config(), on_event)
     request = AsyncMock(side_effect=[
+        {"ok": True},
         {
             "session_id": "session-1",
             "settings_url": "https://strategy.example/settings/session-1",
@@ -162,20 +236,21 @@ async def test_start_session_runs_full_http_lifecycle_and_uses_returned_worker_u
 
     await provider.start_session("call-1", context=provider_context())
 
-    assert request.await_args_list[0].args[:2] == ("POST", "/api/v1/external/sessions")
-    assert request.await_args_list[0].kwargs["payload"]["mode"] == "voice"
-    assert request.await_args_list[1].args[:2] == (
+    assert request.await_args_list[0].args[:2] == ("GET", "/__service/health")
+    assert request.await_args_list[1].args[:2] == ("POST", "/api/v1/external/sessions")
+    assert request.await_args_list[1].kwargs["payload"]["mode"] == "voice"
+    assert request.await_args_list[2].args[:2] == (
         "PUT",
         "https://strategy.example/settings/session-1",
     )
-    settings_payload = request.await_args_list[1].kwargs["payload"]
+    settings_payload = request.await_args_list[2].kwargs["payload"]
     assert settings_payload["network"] == {"mode": "existing", "id": "network-016"}
-    assert settings_payload["human"]["background"] == "客户姓名：张女士"
-    assert request.await_args_list[2].args[:2] == (
+    assert settings_payload["human"]["background"] == "客户背景"
+    assert request.await_args_list[3].args[:2] == (
         "GET",
         "/api/tts/voices?conn_id=session-1",
     )
-    saved = request.await_args_list[3].kwargs["payload"]["settings"]
+    saved = request.await_args_list[4].kwargs["payload"]["settings"]
     assert saved["preserve_me"] == "yes"
     assert saved["qwen3_voice_uuid"] == "voice-2"
     assert "legacy_field" not in saved
@@ -196,6 +271,7 @@ async def test_start_session_runs_full_http_lifecycle_and_uses_returned_worker_u
 async def test_start_session_keeps_server_voice_when_catalog_has_no_choices():
     provider = ExternalStrategyAgentProvider(provider_config(), AsyncMock())
     request = AsyncMock(side_effect=[
+        {"ok": True},
         {
             "session_id": "session-empty-catalog",
             "settings_url": "/api/v1/external/sessions/session-empty-catalog/settings",
@@ -231,7 +307,7 @@ async def test_start_session_keeps_server_voice_when_catalog_has_no_choices():
 
     await provider.start_session("call-empty-catalog", context=provider_context())
 
-    assert request.await_count == 3
+    assert request.await_count == 4
     provider._connect_websocket.assert_awaited_once_with(
         "wss://strategy.example/api/v1/external/sessions/session-empty-catalog/stream"
     )
