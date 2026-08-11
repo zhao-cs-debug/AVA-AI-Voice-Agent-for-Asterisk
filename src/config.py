@@ -773,6 +773,15 @@ class BargeInConfig(BaseModel):
     # Pipeline TalkDetect is only a candidate interruption until STT confirms
     # customer speech. Resume the paused answer when no transcript arrives.
     talk_detect_transcript_confirmation_timeout_ms: int = Field(default=1200)
+    # TALK_DETECT only arms the energy gate. PCM must remain above the adaptive
+    # ambient-noise threshold for this long before playback is paused.
+    pipeline_barge_energy_min_ms: int = Field(default=180)
+    pipeline_barge_energy_absolute_min: int = Field(default=450)
+    pipeline_barge_energy_noise_multiplier: float = Field(default=3.0)
+    pipeline_barge_energy_noise_margin: int = Field(default=200)
+    pipeline_barge_energy_noise_ema_alpha: float = Field(default=0.08)
+    pipeline_barge_energy_gap_tolerance_ms: int = Field(default=40)
+    pipeline_barge_energy_hint_timeout_ms: int = Field(default=1200)
     # New: short guard window after TTS ends to avoid self-echo re-capture
     post_tts_end_protection_ms: int = Field(default=250)
     # Keep the opening audible before allowing transcript-confirmed barge-in.

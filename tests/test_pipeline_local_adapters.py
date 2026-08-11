@@ -87,7 +87,13 @@ async def test_local_stt_adapter_transcribes(monkeypatch):
     await adapter.open_call("call-1", {"mode": "stt"})
 
     set_mode_message = json.loads(mock_ws.sent[0])
-    assert set_mode_message == {"type": "set_mode", "mode": "stt", "call_id": "call-1"}
+    assert set_mode_message == {
+        "type": "set_mode",
+        "mode": "stt",
+        "call_id": "call-1",
+        "language": "zh",
+        "locale": "zh-CN",
+    }
 
     audio_buffer = b"\x01\x02" * 80  # 160 bytes == 20 ms of 8 kHz PCM16
     task = asyncio.create_task(adapter.transcribe("call-1", audio_buffer, 8000, {}))

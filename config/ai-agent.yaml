@@ -18,6 +18,15 @@ barge_in:
   pipeline_talk_detect_silence_ms: 1200
   pipeline_talk_detect_talking_threshold: 256
   talk_detect_initial_protection_ms: 800
+  # TALK_DETECT arms this gate; it does not pause TTS by itself. Inbound PCM
+  # must exceed the per-call noise floor for a sustained interval first.
+  pipeline_barge_energy_min_ms: 180
+  pipeline_barge_energy_absolute_min: 450
+  pipeline_barge_energy_noise_multiplier: 3.0
+  pipeline_barge_energy_noise_margin: 200
+  pipeline_barge_energy_noise_ema_alpha: 0.08
+  pipeline_barge_energy_gap_tolerance_ms: 40
+  pipeline_barge_energy_hint_timeout_ms: 1200
   post_tts_end_protection_ms: 250
   greeting_protection_ms: 3000
   provider_fallback_enabled: true
@@ -1351,6 +1360,8 @@ pipelines:
         # Smart Turn emits completed utterances; AVA waits briefly for trailing
         # final segments before committing exactly one customer turn to the LLM.
         aggregation_timeout_sec: 0.4
+        # Short acknowledgements can be finalized before a follow-up question.
+        acknowledgement_continuation_timeout_sec: 1.8
         base_url: http://host.docker.internal:8080/v1
         max_tokens: 200
         model: mlx-community/Qwen3-8B-4bit
@@ -1359,6 +1370,8 @@ pipelines:
           chat_template_kwargs:
             enable_thinking: false
       stt:
+        language: zh
+        locale: zh-CN
         ws_url: ${LOCAL_WS_URL:-ws://127.0.0.1:18765}
         chunk_ms: 160
         mode: stt

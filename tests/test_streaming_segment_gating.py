@@ -94,6 +94,85 @@ async def test_start_streaming_playback_normalizes_audiosocket_slin(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_external_strategy_stream_passes_queue_audio_rate_to_playback():
+    """Provider audio converted before enqueue must not be resampled again."""
+    call_id = "external-strategy-single-resample"
+    session = CallSession(
+        call_id=call_id,
+        caller_channel_id=call_id,
+        provider_name="external_strategy_agent",
+    )
+    session.conversation_state = "greeting"
+    session.transport_profile = SimpleNamespace(
+        format="slin",
+        sample_rate=8000,
+        wire_sample_rate=8000,
+    )
+
+    start_playback = AsyncMock(return_value="stream-single-resample")
+    engine = object.__new__(Engine)
+    engine.session_store = SimpleNamespace(get_by_call_id=AsyncMock(return_value=session))
+    engine.streaming_playback_manager = SimpleNamespace(
+        continuous_stream=False,
+        start_streaming_playback=start_playback,
+    )
+    engine.conversation_coordinator = None
+    engine.config = SimpleNamespace(
+        downstream_mode="stream",
+        default_provider="external_strategy_agent",
+        streaming=SimpleNamespace(
+            sample_rate=8000,
+            coalesce_enabled=False,
+            coalesce_min_ms=600,
+            micro_fallback_ms=300,
+        ),
+    )
+    engine._provider_stream_queues = {}
+    engine._provider_stream_formats = {}
+    engine._provider_coalesce_buf = {}
+    engine._provider_chunk_seq = {}
+    engine._provider_segment_start_ts = {}
+    engine._provider_bytes = {}
+    engine._enqueued_bytes = {}
+    engine._resample_state_provider_out = {}
+    engine._segment_tts_active = set()
+    engine.provider_alignment_issues = {}
+    engine._runtime_alignment_logged = set()
+    engine._downstream_file_audio_events = {}
+    engine._downstream_file_streaming_logged = set()
+    engine._call_providers = {}
+    engine.providers = {}
+    engine.provider_kinds = {}
+    engine._voiceai_assistant_segment_ids = {}
+    engine._voiceai_last_assistant_segment_ids = {}
+    engine._voiceai_last_assistant_segment_done_ts = {}
+    engine.audio_capture = SimpleNamespace(append_encoded=lambda *args, **kwargs: None)
+    engine._schedule_voiceai_audio_publish = lambda *args, **kwargs: None
+    engine._update_audio_diagnostics = lambda *args, **kwargs: None
+    engine._emit_transport_card = lambda *args, **kwargs: None
+    engine._resolve_stream_targets = lambda *args: ("slin", 8000, None)
+
+    provider_chunk = b"\x01\x00" * 2400  # 100 ms at 24 kHz, PCM16 mono
+    result = await engine.on_provider_event(
+        {
+            "type": "AgentAudio",
+            "call_id": call_id,
+            "data": provider_chunk,
+            "encoding": "linear16",
+            "sample_rate": 24000,
+            "segment_id": "response-1",
+        }
+    )
+
+    assert result is True
+    start_playback.assert_awaited_once()
+    assert start_playback.await_args.kwargs["source_sample_rate"] == 8000
+    queued_chunk = engine._provider_stream_queues[call_id].get_nowait()
+    assert len(queued_chunk) < len(provider_chunk)
+    assert len(queued_chunk) == 1600
+
+
+@pytest.mark.asyncio
 async def test_pipeline_stream_defers_gating_until_first_real_audio_frame(monkeypatch):
     session_store = SessionStore()
     call_id = "call-deferred-gating"

@@ -218,14 +218,17 @@ class _LocalAdapterBase:
         )
         self._sessions[call_id] = session
 
-        await self._send_json(
-            session,
-            {
-                "type": "set_mode",
-                "mode": mode,
-                "call_id": call_id,
-            },
-        )
+        set_mode_payload = {
+            "type": "set_mode",
+            "mode": mode,
+            "call_id": call_id,
+        }
+        if mode == "stt":
+            for field in ("language", "locale"):
+                value = merged.get(field)
+                if value:
+                    set_mode_payload[field] = str(value)
+        await self._send_json(session, set_mode_payload)
         try:
             logger.info(
                 "Local adapter set_mode sent",
@@ -286,6 +289,10 @@ class _LocalAdapterBase:
         merged.setdefault("connect_timeout_sec", merged.get("connect_timeout_sec", 5.0))
         merged.setdefault("response_timeout_sec", merged.get("response_timeout_sec", 5.0))
         merged.setdefault("mode", merged.get("mode", self._default_mode))
+        if self.component_key == "local_stt" and merged.get("mode") == "stt":
+            # Development calls use the Chinese ASR model at session setup.
+            merged["language"] = "zh"
+            merged["locale"] = "zh-CN"
         merged.setdefault("locale", merged.get("locale") or merged.get("language") or "en-US")
         merged.setdefault("chunk_ms", merged.get("chunk_ms", 200))
         return merged

@@ -694,6 +694,22 @@ class Engine:
         """
         return self._get_provider_kind(provider_name) == "external_strategy_agent"
 
+    def _session_uses_external_strategy(self, session: CallSession) -> bool:
+        provider_name = (
+            getattr(session, "provider_name", None)
+            or getattr(self.config, "default_provider", None)
+        )
+        return self._get_provider_kind(provider_name) == "external_strategy_agent"
+
+    @staticmethod
+    def _external_strategy_provider_context(
+        provider_context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        external = provider_context.get("external_strategy")
+        if not isinstance(external, dict):
+            return {}
+        return {"external_strategy": copy.deepcopy(external)}
+
     def _fire_and_forget(self, coro, *, name: Optional[str] = None) -> asyncio.Task:
         """Create a fire-and-forget task with exception logging."""
         task = asyncio.create_task(coro, name=name)
@@ -5719,6 +5735,273 @@ class Engine:
         return semantic not in {"uh", "um", "erm", "hm", "hmm", "oh"}
 
     @staticmethod
+    def _is_valid_barge_in_transcript(text: str) -> bool:
+        """Require an interrupting final to carry more than an isolated cue."""
+        if not Engine._is_valid_customer_transcript(text):
+            return False
+        semantic = "".join(char.casefold() for char in str(text or "") if char.isalnum())
+        return semantic not in {"嗯", "恩", "啊", "哦", "噢", "ah"}
+
+    async def _note_pipeline_talk_detect_hint(self, session: CallSession) -> bool:
+        """Arm, but do not start, a pipeline interruption from TALK_DETECT.
+
+        Asterisk's DSP event is intentionally treated as a low-cost hint. The
+        inbound PCM path still has to prove that the signal is sustained and
+        materially above this call's ambient floor before playback is paused.
+        """
+        call_id = session.call_id
+        if getattr(self, "_pipeline_barge_in_candidates", {}).get(call_id):
+            return False
+        state = session.vad_state.setdefault("pipeline_barge_energy", {})
+        now = time.monotonic()
+        state.update(
+            {
+                "talk_detect_pending": True,
+                "talk_detect_hint_at": now,
+                "qualified_ms": 0,
+                "last_energy": 0,
+            }
+        )
+        try:
+            await self._save_session(session)
+        except Exception:
+            logger.debug("Failed to persist pipeline barge energy hint", call_id=call_id, exc_info=True)
+        return True
+
+    def _pipeline_barge_energy_threshold(
+        self,
+        session: CallSession,
+        cfg: Any,
+        state: Dict[str, Any],
+    ) -> int:
+        absolute_min = max(
+            1,
+            int(
+                getattr(
+                    cfg,
+                    "pipeline_barge_energy_absolute_min",
+                    getattr(cfg, "pipeline_energy_threshold", 300),
+                )
+                or 1
+            ),
+        )
+        noise_floor = max(0.0, float(state.get("noise_floor", 0.0) or 0.0))
+        multiplier = max(
+            1.0,
+            float(getattr(cfg, "pipeline_barge_energy_noise_multiplier", 3.0) or 3.0),
+        )
+        margin = max(0, int(getattr(cfg, "pipeline_barge_energy_noise_margin", 200) or 0))
+        threshold = max(absolute_min, int(round(noise_floor * multiplier + margin)))
+        state["threshold"] = threshold
+        return threshold
+
+    async def _maybe_start_pipeline_barge_in_from_pcm(
+        self,
+        session: CallSession,
+        pcm: bytes,
+        sample_rate: int,
+        *,
+        source: str,
+    ) -> bool:
+        """Require sustained, above-noise PCM before pausing pipeline TTS.
+
+        PCM continues to the STT queue before this method is called. This
+        helper only controls playback, so adding a delay here cannot discard
+        caller audio or make Alibaba ASR lose the beginning of a turn.
+        """
+        cfg = getattr(self.config, "barge_in", None)
+        if not cfg or not bool(getattr(cfg, "enabled", True)):
+            return False
+        call_id = session.call_id
+        candidate_active = bool(getattr(self, "_pipeline_barge_in_candidates", {}).get(call_id))
+
+        now = time.monotonic()
+        state = session.vad_state.setdefault("pipeline_barge_energy", {})
+        pending = bool(state.get("talk_detect_pending", False))
+        talk_detect_state = session.vad_state.get("pipeline_talk_detect", {}) or {}
+        # Use the actual per-call result, not merely the YAML preference. If
+        # Asterisk failed to install TALK_DETECT, local PCM remains a fallback.
+        talk_detect_enabled = pending or bool(talk_detect_state.get("enabled", False))
+        hint_at = float(state.get("talk_detect_hint_at", 0.0) or 0.0)
+        hint_timeout_ms = max(
+            100,
+            int(
+                getattr(
+                    cfg,
+                    "pipeline_barge_energy_hint_timeout_ms",
+                    getattr(cfg, "pipeline_talk_detect_hint_timeout_ms", 1200),
+                )
+                or 1200
+            ),
+        )
+        if talk_detect_enabled and (not pending or not hint_at or (now - hint_at) * 1000 > hint_timeout_ms):
+            if pending:
+                state.update({"talk_detect_pending": False, "qualified_ms": 0})
+            pending = False
+        armed = pending or not talk_detect_enabled
+
+        try:
+            energy = float(audioop.rms(pcm, 2)) if pcm else 0.0
+        except Exception:
+            energy = 0.0
+        state["last_energy"] = int(energy)
+
+        # Learn ambient energy during normal caller listening only. During TTS
+        # this path may contain acoustic echo, so using it as the floor would
+        # make a later real interruption unnecessarily hard to trigger.
+        if bool(getattr(session, "audio_capture_enabled", True)) and not candidate_active:
+            previous_floor = float(state.get("noise_floor", 0.0) or 0.0)
+            alpha = min(
+                1.0,
+                max(0.01, float(getattr(cfg, "pipeline_barge_energy_noise_ema_alpha", 0.08) or 0.08)),
+            )
+            window = [float(value) for value in state.get("noise_window", [])[-49:]]
+            window.append(energy)
+            state["noise_window"] = window
+            ordered = sorted(window)
+            midpoint = len(ordered) // 2
+            median = (
+                ordered[midpoint]
+                if len(ordered) % 2
+                else (ordered[midpoint - 1] + ordered[midpoint]) / 2.0
+            )
+            if previous_floor <= 0.0:
+                state["noise_floor"] = median
+            else:
+                state["noise_floor"] = previous_floor + alpha * (median - previous_floor)
+            state["noise_samples"] = min(500, int(state.get("noise_samples", 0) or 0) + 1)
+            self._pipeline_barge_energy_threshold(session, cfg, state)
+            return False
+        if candidate_active or not armed:
+            return False
+
+        # Opening protection remains independent of the energy gate.
+        protection_ms = max(0, int(getattr(cfg, "initial_protection_ms", 200) or 0))
+        if getattr(session, "conversation_state", None) == "greeting":
+            protection_ms = max(
+                protection_ms,
+                int(getattr(cfg, "greeting_protection_ms", 0) or 0),
+            )
+        tts_started = float(getattr(session, "tts_started_ts", 0.0) or 0.0)
+        if tts_started > 0.0 and (time.time() - tts_started) * 1000 < protection_ms:
+            state["qualified_ms"] = 0
+            return False
+
+        threshold = self._pipeline_barge_energy_threshold(session, cfg, state)
+        frame_ms = max(1, int(round(len(pcm) / (2.0 * max(1, int(sample_rate))) * 1000)))
+        if energy < threshold:
+            gap_ms = int(state.get("gap_ms", 0) or 0) + frame_ms
+            state["gap_ms"] = gap_ms
+            gap_tolerance_ms = max(
+                0,
+                int(getattr(cfg, "pipeline_barge_energy_gap_tolerance_ms", 40) or 0),
+            )
+            if gap_ms > gap_tolerance_ms:
+                state["qualified_ms"] = 0
+            return False
+
+        state["gap_ms"] = 0
+        qualified_ms = int(state.get("qualified_ms", 0) or 0) + frame_ms
+        state["qualified_ms"] = qualified_ms
+        min_ms = max(
+            1,
+            int(
+                getattr(
+                    cfg,
+                    "pipeline_barge_energy_min_ms",
+                    getattr(cfg, "pipeline_min_ms", 120),
+                )
+                or 1
+            ),
+        )
+        if qualified_ms < min_ms:
+            return False
+
+        state.update({"talk_detect_pending": False, "qualified_ms": 0})
+        candidate_source = (
+            f"talkdetect_{source}_energy"
+            if talk_detect_enabled
+            else f"{source}_energy"
+        )
+        started = await self._start_pipeline_barge_in_candidate(
+            session,
+            source=candidate_source,
+        )
+        if started:
+            logger.info(
+                "Pipeline barge-in energy gate qualified",
+                call_id=call_id,
+                source=source,
+                energy=int(energy),
+                threshold=threshold,
+                sustained_ms=qualified_ms,
+            )
+            pending_transcript = str(state.pop("pending_transcript", "") or "").strip()
+            pending_transcript_at = float(state.pop("pending_transcript_at", 0.0) or 0.0)
+            pending_transcript_wall_ts = float(
+                state.pop("pending_transcript_wall_ts", 0.0) or 0.0
+            )
+            tts_started_ts = float(getattr(session, "tts_started_ts", 0.0) or 0.0)
+            transcript_belongs_to_tts = (
+                not tts_started_ts
+                or not pending_transcript_wall_ts
+                or pending_transcript_wall_ts >= tts_started_ts
+            )
+            transcript_near_hint = (
+                not hint_at
+                or not pending_transcript_at
+                or abs(pending_transcript_at - hint_at) * 1000 <= hint_timeout_ms
+            )
+            if (
+                pending_transcript
+                and transcript_belongs_to_tts
+                and transcript_near_hint
+                and call_id in getattr(self, "_pipeline_barge_in_candidates", {})
+            ):
+                await self._confirm_pipeline_barge_in_candidate(call_id, pending_transcript)
+        return bool(started)
+
+    @staticmethod
+    def _is_acknowledgement_only_transcript(text: str) -> bool:
+        """Identify an affirmative acknowledgement that may have a follow-up."""
+        parts = [
+            part.strip()
+            for part in re.split(r"[\s,，。.!！?？；;、:：~～…\-]+", str(text or ""))
+            if part.strip()
+        ]
+        if not parts or len(parts) > 6:
+            return False
+
+        neutral_tokens = {"嗯", "恩", "啊", "哦", "噢"}
+        affirmative_tokens = {"是的", "对", "对的", "好", "好的", "好吧", "行", "可以", "没问题"}
+        if not any(part in affirmative_tokens for part in parts):
+            return False
+        if not all(part in neutral_tokens or part in affirmative_tokens for part in parts):
+            return False
+        # A single "是的" or "好的" is a complete answer and must retain the
+        # normal 400ms response latency. The extension is only for compound
+        # acknowledgements that commonly precede a delayed question.
+        return len(parts) >= 2
+
+    @staticmethod
+    def _append_runtime_prompt_rules(prompt: str) -> str:
+        """Append defensive conversation rules without duplicating them."""
+        base = str(prompt or "").strip()
+        marker = "<runtime_rules>"
+        if marker in base:
+            return base
+        rules = (
+            "<runtime_rules>\n"
+            "<rule>如果客户输入语义不完整、无法确认意图、与当前对话语言明显不一致，"
+            "或者是只包含孤立英文词、单个语气词、疑似噪声的内容，你可以只回复："
+            "“抱歉，我刚才有点没听清，麻烦您重新说一遍，可以吗？”</rule>\n"
+            "<rule>你的回复内容不可以是历史消息中已经出现过的重复内容。回复前检查历史 assistant 消息；"
+            "如本轮没有新信息，不要复述历史答复，而应针对客户当前内容简短回应。</rule>\n"
+            "</runtime_rules>"
+        )
+        return f"{base}\n\n{rules}" if base else rules
+
+    @staticmethod
     def _merge_pipeline_transcript_segment(current: str, incoming: str) -> str:
         """Merge incremental finals while replacing cumulative STT revisions."""
         current = (current or "").strip()
@@ -5957,7 +6240,7 @@ class Engine:
 
     def _note_pipeline_barge_in_asr_activity(self, call_id: str, text: str) -> bool:
         """Keep a candidate open while meaningful customer speech is still partial."""
-        if not self._is_valid_customer_transcript(text):
+        if not self._is_valid_barge_in_transcript(text):
             return False
         state = getattr(self, "_pipeline_barge_in_candidates", {}).get(call_id)
         if not state:
@@ -6021,11 +6304,23 @@ class Engine:
         )
 
     async def _confirm_pipeline_barge_in_candidate(self, call_id: str, text: str) -> bool:
-        if not self._is_valid_customer_transcript(text):
+        if not self._is_valid_barge_in_transcript(text):
             return False
         candidates = getattr(self, "_pipeline_barge_in_candidates", {})
         state = candidates.pop(call_id, None)
         if not state:
+            session = await self.session_store.get_by_call_id(call_id)
+            if session:
+                energy_state = session.vad_state.setdefault("pipeline_barge_energy", {})
+                pipeline_forced = bool(getattr(self, "_pipeline_forced", {}).get(call_id))
+                playback_active = (
+                    not bool(getattr(session, "audio_capture_enabled", True))
+                    or bool(getattr(session, "tts_playing", False))
+                )
+                if pipeline_forced and playback_active:
+                    energy_state["pending_transcript"] = text
+                    energy_state["pending_transcript_at"] = time.monotonic()
+                    energy_state["pending_transcript_wall_ts"] = time.time()
             return False
         timeout_task = state.get("timeout_task")
         if timeout_task and timeout_task is not asyncio.current_task() and not timeout_task.done():
@@ -6087,11 +6382,16 @@ class Engine:
         transcript_queue: asyncio.Queue,
         *,
         settle_seconds: float,
+        acknowledgement_continuation_seconds: float = 1.8,
     ):
         """Yield immutable customer turns after a sliding settlement window."""
         stream_closed = False
         buffered_event: Optional[Dict[str, Any]] = None
         settle_seconds = max(0.0, float(settle_seconds))
+        acknowledgement_continuation_seconds = max(
+            settle_seconds,
+            float(acknowledgement_continuation_seconds),
+        )
         # Realtime ASR may emit a sparse partial and wait for server VAD before
         # sending its final. Keep the turn open for the existing 1s boundary
         # in that state; ordinary final-to-final settlement remains unchanged.
@@ -6119,11 +6419,14 @@ class Engine:
             await self._confirm_pipeline_barge_in_candidate(call_id, event["text"])
             pending_segments = [{"text": event["text"], "event": event}]
             seen_event_ids = {event["event_id"]} if event.get("event_id") else set()
+            acknowledgement_candidate = self._is_acknowledgement_only_transcript(event["text"])
             delay = self._pipeline_settlement_delay_seconds(
                 event,
                 settle_seconds=settle_seconds,
                 short_onset_fallback_seconds=partial_final_timeout,
             )
+            if acknowledgement_candidate:
+                delay = max(delay, acknowledgement_continuation_seconds)
             deadline = asyncio.get_running_loop().time() + delay
 
             while delay > 0:
@@ -6165,7 +6468,15 @@ class Engine:
                     last_segment["event"],
                     next_normalized,
                 )
-                if source_gap_ms is not None and source_gap_ms > settle_seconds * 1000.0:
+                allowed_source_gap_seconds = (
+                    acknowledgement_continuation_seconds
+                    if acknowledgement_candidate
+                    else settle_seconds
+                )
+                if (
+                    source_gap_ms is not None
+                    and source_gap_ms > allowed_source_gap_seconds * 1000.0
+                ):
                     buffered_event = next_normalized
                     break
 
@@ -6193,6 +6504,7 @@ class Engine:
                         "text": next_normalized["text"],
                         "event": next_normalized,
                     })
+                acknowledgement_candidate = False
                 if event_id:
                     seen_event_ids.add(event_id)
                 delay = self._pipeline_settlement_delay_seconds(
@@ -6307,6 +6619,16 @@ class Engine:
                     await self._save_session(session)
             except Exception:
                 pass
+
+            if bool(getattr(self, "_pipeline_forced", {}).get(call_id)):
+                armed = await self._note_pipeline_talk_detect_hint(session)
+                if armed:
+                    logger.info(
+                        "Pipeline TalkDetect armed adaptive energy gate",
+                        call_id=call_id,
+                        channel_id=channel_id,
+                    )
+                return
 
             if await self._start_pipeline_barge_in_candidate(session, source="talkdetect"):
                 logger.info(
@@ -7536,112 +7858,14 @@ class Engine:
                 else:
                     logger.warning("Pipeline mode active but no queue found (AudioSocket)", call_id=caller_channel_id)
 
-                # AAVA-28: Check gating to prevent agent from hearing its own TTS output
-                if not session.audio_capture_enabled:
-                    # Keep ASR full-duplex above, while playback remains gated until
-                    # TalkDetect plus a meaningful final confirms the interruption.
-                    cfg = getattr(self.config, "barge_in", None)
-                    if not cfg or not getattr(cfg, "enabled", True):
-                        return
-                    # If TALK_DETECT is enabled for this pipeline, prefer it over local energy checks
-                    # to avoid double-triggering and false positives on AudioSocket.
-                    try:
-                        td = (session.vad_state or {}).get("pipeline_talk_detect", {}) or {}
-                        if bool(td.get("enabled", False)):
-                            return
-                    except Exception:
-                        pass
-                    now = time.time()
-                    tts_elapsed_ms = 0
-                    try:
-                        if getattr(session, "tts_started_ts", 0.0) > 0:
-                            tts_elapsed_ms = int((now - float(session.tts_started_ts)) * 1000)
-                    except Exception:
-                        tts_elapsed_ms = 0
-                    initial_protect = int(getattr(cfg, "initial_protection_ms", 200))
-                    try:
-                        if getattr(session, "conversation_state", None) == "greeting":
-                            greet_ms = int(getattr(cfg, "greeting_protection_ms", 0))
-                            if greet_ms > initial_protect:
-                                initial_protect = greet_ms
-                    except Exception:
-                        pass
-                    if tts_elapsed_ms < initial_protect:
-                        return
-                    try:
-                        energy = audioop.rms(pcm_bytes, 2)
-                    except Exception:
-                        energy = 0
-                    threshold = int(getattr(cfg, "pipeline_energy_threshold", 0) or getattr(cfg, "energy_threshold", 1000))
-                    try:
-                        frame_ms = int((len(pcm_bytes) / float(2 * max(1, int(pcm_rate)))) * 1000)
-                        if frame_ms <= 0:
-                            frame_ms = 20
-                    except Exception:
-                        frame_ms = 20
-                    if energy >= threshold:
-                        if int(getattr(session, "barge_in_candidate_ms", 0)) == 0:
-                            try:
-                                session.barge_start_ts = now
-                            except Exception:
-                                session.barge_start_ts = 0.0
-                        session.barge_in_candidate_ms = int(getattr(session, "barge_in_candidate_ms", 0)) + frame_ms
-                    else:
-                        session.barge_in_candidate_ms = 0
-
-                    # Debug monitor (rate-limited) so we can see why pipeline barge-in is/isn't firing.
-                    try:
-                        mon = session.vad_state.setdefault("pipeline_barge_mon", {})
-                        last = float(mon.get("last_ts", 0.0) or 0.0)
-                        if now - last >= 1.0:
-                            mon["last_ts"] = now
-                            logger.debug(
-                                "Pipeline barge-in monitor (AudioSocket)",
-                                call_id=caller_channel_id,
-                                tts_elapsed_ms=tts_elapsed_ms,
-                                energy=energy,
-                                threshold=threshold,
-                                candidate_ms=int(getattr(session, "barge_in_candidate_ms", 0) or 0),
-                                audio_capture_enabled=session.audio_capture_enabled,
-                            )
-                    except Exception:
-                        pass
-
-                    cooldown_ms = int(getattr(cfg, "cooldown_ms", 500))
-                    last_barge_in_ts = float(getattr(session, "last_barge_in_ts", 0.0) or 0.0)
-                    in_cooldown = (now - last_barge_in_ts) * 1000 < cooldown_ms if last_barge_in_ts else False
-                    provider_name = getattr(session, "provider_name", None) or self.config.default_provider
-                    min_ms = self._resolve_barge_in_min_ms(
-                        session,
-                        cfg,
-                        pipeline_mode=True,
-                        provider_name=provider_name,
-                    )
-                    if not in_cooldown and int(getattr(session, "barge_in_candidate_ms", 0)) >= min_ms:
-                        try:
-                            try:
-                                if float(getattr(session, "barge_start_ts", 0.0) or 0.0) > 0.0:
-                                    reaction_s = max(0.0, now - float(session.barge_start_ts))
-                                    _BARGE_REACTION_SECONDS.observe(reaction_s)
-                                    session.barge_start_ts = 0.0
-                            except Exception:
-                                pass
-                            await self._apply_barge_in_action(
-                                caller_channel_id,
-                                source="local_vad",
-                                reason="pipeline_tts_overlap",
-                            )
-                            session.audio_capture_enabled = True
-                            logger.info("🎧 BARGE-IN (AudioSocket/pipeline) triggered", call_id=caller_channel_id)
-                        except Exception:
-                            logger.error("Error triggering AudioSocket pipeline barge-in", call_id=caller_channel_id, exc_info=True)
-                    else:
-                        if int(getattr(session, "barge_in_candidate_ms", 0) or 0) > 0 and self.conversation_coordinator:
-                            try:
-                                self.conversation_coordinator.note_audio_during_tts(caller_channel_id)
-                            except Exception:
-                                pass
-                        return
+                # Learn the per-call ambient floor while listening; during TTS
+                # this same helper applies TalkDetect + duration + energy gating.
+                await self._maybe_start_pipeline_barge_in_from_pcm(
+                    session,
+                    pcm_bytes,
+                    pcm_rate,
+                    source="audiosocket",
+                )
                 return
 
             # Unconditional continuous-input forward: Deepgram/OpenAI Realtime expect raw audio flow
@@ -8911,6 +9135,60 @@ class Engine:
     def _ensure_pipeline_call_active(self, call_id: str) -> None:
         if self._is_pipeline_call_terminating(call_id):
             raise asyncio.CancelledError(f"pipeline call {call_id} is terminating")
+        task_generations = getattr(self, "_pipeline_turn_task_generations", {})
+        try:
+            current_task = asyncio.current_task()
+        except RuntimeError:
+            current_task = None
+        generation = task_generations.get(current_task) if current_task is not None else None
+        if generation is not None:
+            current_generation = getattr(self, "_pipeline_turn_generations", {}).get(call_id)
+            if current_generation != generation:
+                raise asyncio.CancelledError(
+                    f"pipeline turn {call_id}:{generation} was superseded by {current_generation}"
+                )
+
+    def _ensure_pipeline_turn_current(self, call_id: str, generation: int) -> None:
+        """Reject work from an LLM turn superseded by newer customer speech."""
+        self._ensure_pipeline_call_active(call_id)
+        current_generation = getattr(self, "_pipeline_turn_generations", {}).get(call_id)
+        if current_generation != generation:
+            raise asyncio.CancelledError(
+                f"pipeline turn {call_id}:{generation} was superseded by {current_generation}"
+            )
+
+    async def _stop_pipeline_output_for_supersede(self, call_id: str) -> None:
+        """Stop only the previous answer's output when a newer turn takes ownership."""
+        try:
+            stream_info = self.streaming_playback_manager.active_streams.get(call_id)
+            if stream_info is not None:
+                stream_info["end_reason"] = "superseded"
+            await self.streaming_playback_manager.stop_streaming_playback(call_id)
+        except Exception:
+            logger.debug(
+                "Failed to stop superseded pipeline stream",
+                call_id=call_id,
+                exc_info=True,
+            )
+
+        try:
+            playback_ids = await self.session_store.list_playbacks_for_call(call_id)
+            for playback_id in playback_ids:
+                try:
+                    await self.ari_client.stop_playback(playback_id)
+                except Exception:
+                    logger.debug(
+                        "Failed to stop superseded pipeline playback",
+                        call_id=call_id,
+                        playback_id=playback_id,
+                        exc_info=True,
+                    )
+        except Exception:
+            logger.debug(
+                "Failed to enumerate superseded pipeline playbacks",
+                call_id=call_id,
+                exc_info=True,
+            )
 
     def _mark_pipeline_turn_terminated(self, call_id: str, *, reason: str) -> None:
         tracker = getattr(self, "_pipeline_turn_trackers", {}).get(call_id)
@@ -9110,11 +9388,13 @@ class Engine:
         turn.mark_ai_generated(response_text)
         tts_bytes = bytearray()
         try:
+            self._ensure_pipeline_call_active(call_id)
             async for chunk in pipeline.tts_adapter.synthesize(
                 call_id,
                 response_text,
                 pipeline.tts_options,
             ):
+                self._ensure_pipeline_call_active(call_id)
                 if chunk:
                     tts_bytes.extend(chunk)
         except Exception:
@@ -9125,6 +9405,7 @@ class Engine:
             turn.mark_failed("tool_followup_no_audio")
             return
 
+        self._ensure_pipeline_call_active(call_id)
         playback_id = await self.playback_manager.play_audio(
             call_id,
             bytes(tts_bytes),
@@ -9145,6 +9426,7 @@ class Engine:
             TurnLifecycleState.INTERRUPTED,
         }:
             return
+        self._ensure_pipeline_call_active(call_id)
         try:
             await self._publish_pipeline_assistant_turn(call_id, turn)
         except Exception:
@@ -9448,106 +9730,6 @@ class Engine:
                 has_queue=caller_channel_id in self._pipeline_queues,
             )
             if pipeline_forced:
-                # AAVA-28: Check gating to prevent agent from hearing its own TTS output
-                if not session.audio_capture_enabled:
-                    # Pipelines: allow barge-in detection during TTS gating, but do not forward audio until triggered.
-                    cfg = getattr(self.config, "barge_in", None)
-                    if not cfg or not getattr(cfg, "enabled", True):
-                        return
-                    # If TALK_DETECT is enabled for this pipeline, prefer it over local energy checks.
-                    try:
-                        td = (session.vad_state or {}).get("pipeline_talk_detect", {}) or {}
-                        if bool(td.get("enabled", False)):
-                            return
-                    except Exception:
-                        pass
-                    now = time.time()
-                    tts_elapsed_ms = 0
-                    try:
-                        if getattr(session, "tts_started_ts", 0.0) > 0:
-                            tts_elapsed_ms = int((now - float(session.tts_started_ts)) * 1000)
-                    except Exception:
-                        tts_elapsed_ms = 0
-                    initial_protect = int(getattr(cfg, "initial_protection_ms", 200))
-                    try:
-                        if getattr(session, "conversation_state", None) == "greeting":
-                            greet_ms = int(getattr(cfg, "greeting_protection_ms", 0))
-                            if greet_ms > initial_protect:
-                                initial_protect = greet_ms
-                    except Exception:
-                        pass
-                    if tts_elapsed_ms < initial_protect:
-                        return
-                    try:
-                        energy = audioop.rms(pcm_16k, 2)
-                    except Exception:
-                        energy = 0
-                    threshold = int(getattr(cfg, "pipeline_energy_threshold", 0) or getattr(cfg, "energy_threshold", 1000))
-                    frame_ms = 20
-                    if energy >= threshold:
-                        if int(getattr(session, "barge_in_candidate_ms", 0)) == 0:
-                            try:
-                                session.barge_start_ts = now
-                            except Exception:
-                                session.barge_start_ts = 0.0
-                        session.barge_in_candidate_ms = int(getattr(session, "barge_in_candidate_ms", 0)) + frame_ms
-                    else:
-                        session.barge_in_candidate_ms = 0
-
-                    # Debug monitor (rate-limited) so we can see why pipeline barge-in is/isn't firing.
-                    try:
-                        mon = session.vad_state.setdefault("pipeline_barge_mon", {})
-                        last = float(mon.get("last_ts", 0.0) or 0.0)
-                        if now - last >= 1.0:
-                            mon["last_ts"] = now
-                            logger.debug(
-                                "Pipeline barge-in monitor (RTP)",
-                                call_id=caller_channel_id,
-                                tts_elapsed_ms=tts_elapsed_ms,
-                                energy=energy,
-                                threshold=threshold,
-                                candidate_ms=int(getattr(session, "barge_in_candidate_ms", 0) or 0),
-                                audio_capture_enabled=session.audio_capture_enabled,
-                            )
-                    except Exception:
-                        pass
-
-                    cooldown_ms = int(getattr(cfg, "cooldown_ms", 500))
-                    last_barge_in_ts = float(getattr(session, "last_barge_in_ts", 0.0) or 0.0)
-                    in_cooldown = (now - last_barge_in_ts) * 1000 < cooldown_ms if last_barge_in_ts else False
-                    provider_name = getattr(session, "provider_name", None) or self.config.default_provider
-                    min_ms = self._resolve_barge_in_min_ms(
-                        session,
-                        cfg,
-                        pipeline_mode=True,
-                        provider_name=provider_name,
-                    )
-                    if not in_cooldown and int(getattr(session, "barge_in_candidate_ms", 0)) >= min_ms:
-                        try:
-                            try:
-                                if float(getattr(session, "barge_start_ts", 0.0) or 0.0) > 0.0:
-                                    reaction_s = max(0.0, now - float(session.barge_start_ts))
-                                    _BARGE_REACTION_SECONDS.observe(reaction_s)
-                                    session.barge_start_ts = 0.0
-                            except Exception:
-                                pass
-                            await self._apply_barge_in_action(
-                                caller_channel_id,
-                                source="local_vad",
-                                reason="pipeline_tts_overlap",
-                            )
-                            session.audio_capture_enabled = True
-                            logger.info("🎧 BARGE-IN (RTP/pipeline) triggered", call_id=caller_channel_id)
-                        except Exception:
-                            logger.error("Error triggering RTP pipeline barge-in", call_id=caller_channel_id, exc_info=True)
-                    else:
-                        if int(getattr(session, "barge_in_candidate_ms", 0) or 0) > 0 and self.conversation_coordinator:
-                            try:
-                                self.conversation_coordinator.note_audio_during_tts(caller_channel_id)
-                            except Exception:
-                                pass
-                        return
-                
                 q = self._pipeline_queues.get(caller_channel_id)
                 if q:
                     try:
@@ -9561,13 +9743,37 @@ class Engine:
                                 sample_rate=16000,
                             )
                         except Exception:
-                            logger.debug("VoiceAI user audio publish failed (RTP/pipeline)", call_id=caller_channel_id, exc_info=True)
-                        logger.debug("RTP audio routed to pipeline queue", call_id=caller_channel_id, bytes=len(pcm_16k))
+                            logger.debug(
+                                "VoiceAI user audio publish failed (RTP/pipeline)",
+                                call_id=caller_channel_id,
+                                exc_info=True,
+                            )
+                        logger.debug(
+                            "RTP audio routed to pipeline queue",
+                            call_id=caller_channel_id,
+                            bytes=len(pcm_16k),
+                        )
                     except Exception as exc:
-                        logger.warning("Pipeline queue full or unavailable (RTP)", call_id=caller_channel_id, error=str(exc))
-                    return  # Done - don't route to monolithic provider
+                        logger.warning(
+                            "Pipeline queue full or unavailable (RTP)",
+                            call_id=caller_channel_id,
+                            error=str(exc),
+                        )
                 else:
-                    logger.warning("Pipeline mode active but no queue found (RTP)", call_id=caller_channel_id)
+                    logger.warning(
+                        "Pipeline mode active but no queue found (RTP)",
+                        call_id=caller_channel_id,
+                    )
+
+                # Learn the per-call ambient floor while listening; during TTS
+                # this same helper applies TalkDetect + duration + energy gating.
+                await self._maybe_start_pipeline_barge_in_from_pcm(
+                    session,
+                    pcm_16k,
+                    int(getattr(self.rtp_server, "sample_rate", 16000) if self.rtp_server else 16000),
+                    source="rtp",
+                )
+                return  # Done - don't route to monolithic provider
 
             # Check if provider requires continuous audio input using capabilities
             # Full agents with native VAD need uninterrupted audio flow for turn-taking
@@ -10616,6 +10822,12 @@ class Engine:
                         prov_out_state = self._resample_state_provider_out.get(call_id)
                         out_chunk, prov_out_state = resample_audio(chunk, rate, wire_rate, state=prov_out_state)
                         self._resample_state_provider_out[call_id] = prov_out_state
+                        # The queue receives out_chunk, not the provider-native bytes. Keep
+                        # its format metadata aligned so StreamingPlaybackManager does not
+                        # resample the already-converted audio a second time.
+                        fmt_entry["encoding"] = "linear16"
+                        fmt_entry["sample_rate"] = int(wire_rate)
+                        self._provider_stream_formats[call_id] = fmt_entry
                         seq = self._provider_chunk_seq.get(call_id, 0) + 1
                         self._provider_chunk_seq[call_id] = seq
                         logger.info(
@@ -12620,6 +12832,17 @@ class Engine:
         except Exception:
             logger.debug("Outbound custom_vars injection failed (pipeline)", call_id=call_id, exc_info=True)
 
+        # Apply the same runtime conversation safeguards to every local
+        # pipeline prompt after context and outbound data have been resolved.
+        if (
+            str(getattr(pipeline, "stt_key", "") or "") == "local_stt"
+            or str(getattr(pipeline, "tts_key", "") or "") == "local_tts"
+        ):
+            llm_options = dict(llm_options)
+            llm_options["system_prompt"] = self._append_runtime_prompt_rules(
+                str(llm_options.get("system_prompt") or "")
+            )
+
         # Accumulate into ~160ms chunks for STT while keeping ingestion responsive
         bytes_per_ms = 32  # 16k Hz * 2 bytes / 1000 ms
         base_commit_ms = 160
@@ -12636,6 +12859,8 @@ class Engine:
             stt_options.setdefault("streaming", True)
             stt_options.setdefault("stream_format", stt_options.get("stream_format") or "pcm16_16k")
             stt_options.setdefault("mode", stt_options.get("mode") or "stt")
+            stt_options["language"] = "zh"
+            stt_options["locale"] = "zh-CN"
             if not chunk_ms_explicit or stt_options.get("chunk_ms") in (None, "", 0):
                 stt_options["chunk_ms"] = 160
             if not streaming_explicit:
@@ -13257,10 +13482,39 @@ class Engine:
         transcript_queue: asyncio.Queue,
         *,
         settle_seconds: float,
-        run_turn: Callable[[str], Any],
+        acknowledgement_continuation_seconds: float = 1.8,
+        run_turn: Callable[[str, int], Any],
     ) -> None:
-        """Settle ASR continuously while executing committed turns sequentially."""
+        """Settle ASR continuously while giving the newest committed turn ownership."""
         committed_queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
+        active_turn_task: Optional[asyncio.Task] = None
+        retired_turn_tasks: set[asyncio.Task] = set()
+        generation = 0
+        turn_generations = getattr(self, "_pipeline_turn_generations", None)
+        if turn_generations is None:
+            turn_generations = {}
+            self._pipeline_turn_generations = turn_generations
+        task_generations = getattr(self, "_pipeline_turn_task_generations", None)
+        if task_generations is None:
+            task_generations = {}
+            self._pipeline_turn_task_generations = task_generations
+
+        def observe_retired_task(task: asyncio.Task) -> None:
+            retired_turn_tasks.discard(task)
+            task_generations.pop(task, None)
+            if task.cancelled():
+                return
+            try:
+                error = task.exception()
+            except asyncio.CancelledError:
+                return
+            if error:
+                logger.debug(
+                    "Superseded pipeline turn finished with an error",
+                    call_id=call_id,
+                    error=str(error),
+                    exc_info=error,
+                )
 
         async def collect_committed_turns() -> None:
             try:
@@ -13268,6 +13522,7 @@ class Engine:
                     call_id,
                     transcript_queue,
                     settle_seconds=settle_seconds,
+                    acknowledgement_continuation_seconds=acknowledgement_continuation_seconds,
                 ):
                     await committed_queue.put(committed)
             finally:
@@ -13282,12 +13537,46 @@ class Engine:
                 committed = await committed_queue.get()
                 if committed is None:
                     break
-                await run_turn(committed)
+                generation += 1
+                turn_generations[call_id] = generation
+
+                previous_task = active_turn_task
+                if previous_task is not None and not previous_task.done():
+                    previous_task.cancel(
+                        f"superseded by customer turn generation {generation}"
+                    )
+                    retired_turn_tasks.add(previous_task)
+                    previous_task.add_done_callback(observe_retired_task)
+                    await self._stop_pipeline_output_for_supersede(call_id)
+
+                active_turn_task = asyncio.create_task(
+                    run_turn(committed, generation),
+                    name=f"pipeline-dialog-turn-{call_id}-{generation}",
+                )
+                task_generations[active_turn_task] = generation
+
+            if active_turn_task is not None:
+                await asyncio.gather(active_turn_task, return_exceptions=True)
+            if retired_turn_tasks:
+                await asyncio.gather(*retired_turn_tasks, return_exceptions=True)
             await collector_task
         finally:
             if not collector_task.done():
                 collector_task.cancel()
                 await asyncio.gather(collector_task, return_exceptions=True)
+            if active_turn_task is not None and not active_turn_task.done():
+                active_turn_task.cancel()
+                await asyncio.gather(active_turn_task, return_exceptions=True)
+            for task in tuple(retired_turn_tasks):
+                if not task.done():
+                    task.cancel()
+            if retired_turn_tasks:
+                await asyncio.gather(*retired_turn_tasks, return_exceptions=True)
+            if active_turn_task is not None:
+                task_generations.pop(active_turn_task, None)
+            for task in tuple(retired_turn_tasks):
+                task_generations.pop(task, None)
+            turn_generations.pop(call_id, None)
 
     async def _run_pipeline_dialog(self, context: PipelineRunnerContext) -> None:
         call_id = context.call_id
@@ -13307,11 +13596,17 @@ class Engine:
                 (pipeline.llm_options or {}).get("aggregation_timeout_sec", 0.4),
             )
         )
+        acknowledgement_continuation_seconds = float(
+            (pipeline.llm_options or {}).get(
+                "acknowledgement_continuation_timeout_sec",
+                1.8,
+            )
+        )
         # Track conversation history to include prior messages
         # AAVA-85 FIX: Initialize from session to preserve greeting
         conversation_history: List[Dict[str, str]] = list(session.conversation_history or [])
 
-        async def run_turn(transcript_text: str) -> None:
+        async def run_turn(transcript_text: str, turn_generation: int) -> None:
             nonlocal conversation_history
             self._ensure_pipeline_call_active(call_id)
             response_text = ""
@@ -13630,6 +13925,7 @@ class Engine:
                         pass
                     if stream_info:
                         await self._finish_pipeline_stream_turn(lifecycle_turn, stream_info)
+                    self._ensure_pipeline_turn_current(call_id, turn_generation)
                     if lifecycle_turn.audible_text:
                         try:
                             await self._publish_pipeline_assistant_turn(call_id, lifecycle_turn)
@@ -13672,6 +13968,7 @@ class Engine:
                     if stream_info is not None:
                         await self._finish_pipeline_stream_turn(lifecycle_turn, stream_info)
                     if lifecycle_turn.state is TurnLifecycleState.INTERRUPTED:
+                        self._ensure_pipeline_turn_current(call_id, turn_generation)
                         if lifecycle_turn.audible_text:
                             try:
                                 await self._publish_pipeline_assistant_turn(call_id, lifecycle_turn)
@@ -13704,6 +14001,7 @@ class Engine:
                 if full_response_text.strip():
                     response_text = full_response_text.strip()
                     _streaming_handled = True
+                    self._ensure_pipeline_turn_current(call_id, turn_generation)
                     if lifecycle_turn.state in {
                         TurnLifecycleState.COMPLETED,
                         TurnLifecycleState.INTERRUPTED,
@@ -13733,6 +14031,7 @@ class Engine:
                         return
 
                     # Check for tool calls detected during streaming
+                    self._ensure_pipeline_turn_current(call_id, turn_generation)
                     _pending_tools = getattr(pipeline.llm_adapter, "_pending_tool_calls_by_call", {}).get(call_id) or []
                     if _pending_tools:
                         logger.info(
@@ -13751,6 +14050,7 @@ class Engine:
                     # Fall through to tool execution below if tool calls were found
                 else:
                     # Streaming produced no text — likely a tool-call-only response.
+                    self._ensure_pipeline_turn_current(call_id, turn_generation)
                     _pending_tools = getattr(pipeline.llm_adapter, "_pending_tool_calls_by_call", {}).get(call_id) or []
                     if _pending_tools:
                         tool_calls = list(_pending_tools)
@@ -14187,6 +14487,7 @@ class Engine:
                     elif lifecycle_turn.state is not TurnLifecycleState.FAILED:
                         lifecycle_turn.mark_failed("tts_no_audio")
 
+            self._ensure_pipeline_turn_current(call_id, turn_generation)
             if response_text and not _streaming_handled and lifecycle_turn.state in {
                 TurnLifecycleState.COMPLETED,
                 TurnLifecycleState.INTERRUPTED,
@@ -14271,6 +14572,7 @@ class Engine:
                                     except Exception:
                                         logger.debug("Failed to speak slow-response message", call_id=call_id, exc_info=True)
                             result = await tool_task
+                            self._ensure_pipeline_turn_current(call_id, turn_generation)
                             tool_duration_ms = (time.time() - _tool_start) * 1000
                             logger.info("Tool execution result", tool=name, result=result)
 
@@ -14478,6 +14780,10 @@ class Engine:
                 call_id,
                 transcript_queue,
                 settle_seconds=max(0.0, settle_seconds),
+                acknowledgement_continuation_seconds=max(
+                    max(0.0, settle_seconds),
+                    acknowledgement_continuation_seconds,
+                ),
                 run_turn=run_turn,
             )
         except asyncio.CancelledError:
@@ -14760,6 +15066,9 @@ class Engine:
             provider_name = session.provider_name or self.config.default_provider
 
         provider_name = str(provider_name or "").strip()
+        uses_external_strategy = (
+            self._get_provider_kind(provider_name) == "external_strategy_agent"
+        )
 
         # Persist provider selection for the rest of the call flow. This is critical when
         # pipeline mode is enabled globally (active_pipeline), but a context wants a
@@ -14853,6 +15162,9 @@ class Engine:
             # Store per-call provider overrides (do NOT mutate global provider templates).
             try:
                 session.provider_overrides = dict(getattr(session, "provider_overrides", {}) or {})
+                if uses_external_strategy:
+                    for key in ("greeting", "prompt", "default_voice"):
+                        session.provider_overrides.pop(key, None)
                 session.provider_overrides["target_encoding"] = transport.wire_encoding
                 session.provider_overrides["target_sample_rate_hz"] = transport.wire_sample_rate
                 await self._save_session(session)
@@ -14863,14 +15175,14 @@ class Engine:
                     exc_info=True,
                 )
 
-            # Get context config for prompt/greeting and store as per-call overrides.
+            # Local providers can source prompt, greeting, and HiFi voice from the context.
             context_config = None
             logger.debug(
                 "Checking context config",
                 call_id=session.call_id,
                 transport_context=transport.context if hasattr(transport, "context") else None,
             )
-            if transport.context:
+            if transport.context and not uses_external_strategy:
                 context_config = self.transport_orchestrator.get_context_config(transport.context)
                 logger.debug(
                     "Context config loaded",
@@ -14982,7 +15294,7 @@ class Engine:
 
     async def _start_context_background_music(self, session, context_name: Optional[str]) -> None:
         """Start configured context background music for provider and pipeline calls."""
-        if not context_name:
+        if not context_name or self._session_uses_external_strategy(session):
             return
         try:
             context_config = self.transport_orchestrator.get_context_config(context_name)
@@ -15915,11 +16227,12 @@ class Engine:
         if not cfg:
             return
 
-        greeting = overrides.get("greeting")
-        prompt = overrides.get("prompt")
+        uses_external_strategy = self._session_uses_external_strategy(session)
+        greeting = None if uses_external_strategy else overrides.get("greeting")
+        prompt = None if uses_external_strategy else overrides.get("prompt")
         target_encoding = overrides.get("target_encoding")
         target_rate = overrides.get("target_sample_rate_hz")
-        default_voice = overrides.get("default_voice")
+        default_voice = None if uses_external_strategy else overrides.get("default_voice")
 
         try:
             if isinstance(cfg, dict):
@@ -16147,10 +16460,34 @@ class Engine:
             # Note: Context greeting/prompt injection now happens earlier in P1 _resolve_audio_profile()
             # to ensure config is set BEFORE provider session starts and reads it.
             
-            # Build context dict for providers that need it (Google Live, OpenAI Realtime)
+            # Build only the context contract owned by the selected provider.
             provider_context = {}
+            uses_external_strategy = (
+                self._get_provider_kind(provider_name) == "external_strategy_agent"
+            )
+            if uses_external_strategy and session.context_name:
+                try:
+                    context_config = self.transport_orchestrator.get_context_config(
+                        session.context_name
+                    )
+                    external_strategy = getattr(
+                        context_config,
+                        "external_strategy",
+                        None,
+                    ) if context_config else None
+                    if isinstance(external_strategy, dict):
+                        provider_context["external_strategy"] = copy.deepcopy(
+                            external_strategy
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to load external strategy context",
+                        call_id=call_id,
+                        error=str(exc),
+                        exc_info=True,
+                    )
             try:
-                if session.context_name:
+                if session.context_name and not uses_external_strategy:
                     context_config = self.transport_orchestrator.get_context_config(session.context_name)
                     logger.debug(
                         "Building provider context",
@@ -16292,11 +16629,14 @@ class Engine:
                             provider_context['greeting'] = self._apply_prompt_template_substitution(context_config.greeting, session)
             except Exception as e:
                 logger.warning(f"Failed to build provider context: {e}", call_id=call_id, exc_info=True)
-            
-            # Add caller info for personalization (ElevenLabs dynamic variables)
-            # Always pass these with defaults - ElevenLabs requires them if used in first message
-            provider_context["caller_name"] = session.caller_name or "there"
-            provider_context["caller_id"] = session.caller_number or ""
+
+            if uses_external_strategy:
+                provider_context = self._external_strategy_provider_context(provider_context)
+                session.allowed_tools = []
+            else:
+                # Add caller info for personalization (ElevenLabs dynamic variables).
+                provider_context["caller_name"] = session.caller_name or "there"
+                provider_context["caller_id"] = session.caller_number or ""
             
             # Inject tool execution context into provider if it supports tools (Deepgram, Google Live)
             if hasattr(provider, 'tool_adapter') or hasattr(provider, '_tool_adapter'):
@@ -16320,7 +16660,7 @@ class Engine:
             logger.info("Provider session started", call_id=call_id, provider=provider_name)
             # If provider supports an explicit greeting (e.g., LocalProvider), trigger it now
             try:
-                if hasattr(provider, 'play_initial_greeting'):
+                if not uses_external_strategy and hasattr(provider, 'play_initial_greeting'):
                     await provider.play_initial_greeting(call_id)
             except Exception:
                 logger.debug("Provider initial greeting failed or unsupported", exc_info=True)
@@ -16866,6 +17206,9 @@ class Engine:
         Returns:
             Dictionary of output_variable_name -> value (strings only)
         """
+        if self._session_uses_external_strategy(session):
+            return {}
+
         from src.tools.base import ToolPhase
         from src.tools.context import PreCallContext
         from src.tools.registry import tool_registry
@@ -17082,6 +17425,9 @@ class Engine:
             call_duration_seconds: Pre-calculated call duration in seconds
             call_outcome: How the call ended (caller_hangup, agent_hangup, transferred)
         """
+        if self._session_uses_external_strategy(session):
+            return
+
         from src.tools.base import ToolPhase
         from src.tools.context import PostCallContext
         from src.tools.registry import tool_registry
