@@ -76,6 +76,40 @@ def test_customer_capture_accepts_allowlisted_called_number(tmp_path):
     assert (tmp_path / "call-to-701" / "customer.wav").exists()
 
 
+def test_customer_capture_writes_denoised_comparison_as_separate_stream(tmp_path):
+    capture = CustomerAudioCaptureManager(
+        enabled=True,
+        caller_allowlist={"701"},
+        base_dir=str(tmp_path),
+    )
+    raw_pcm = b"\x01\x00" * 160
+    denoised_pcm = b"\x02\x00" * 160
+
+    capture.append_pcm16(
+        call_id="call-comparison",
+        caller_number="701",
+        called_number="unknown",
+        pcm16=raw_pcm,
+        sample_rate=16000,
+    )
+    capture.append_pcm16(
+        call_id="call-comparison",
+        caller_number="701",
+        called_number="unknown",
+        pcm16=denoised_pcm,
+        sample_rate=16000,
+        stream_name="customer_denoised",
+    )
+    capture.close_call("call-comparison")
+
+    with wave.open(str(tmp_path / "call-comparison" / "customer.wav"), "rb") as wav_file:
+        assert wav_file.readframes(wav_file.getnframes()) == raw_pcm
+    with wave.open(
+        str(tmp_path / "call-comparison" / "customer_denoised.wav"), "rb"
+    ) as wav_file:
+        assert wav_file.readframes(wav_file.getnframes()) == denoised_pcm
+
+
 def test_customer_capture_from_environment_requires_nonempty_allowlist(tmp_path):
     capture = CustomerAudioCaptureManager.from_environment(
         {

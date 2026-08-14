@@ -15,6 +15,7 @@ from .openai import (
     OpenAILLMAdapter,
     OpenAITTSAdapter,
 )
+from .vllm_omni import VllmOmniTTSAdapter
 from .telnyx import (
     TelnyxLLMAdapter,
 )
@@ -28,6 +29,7 @@ from .orchestrator import (
     PipelineOrchestratorError,
     PipelineUnavailableError,
     PipelineResolution,
+    resolve_channel_runtime_override,
 )
 
 __all__ = [
@@ -40,6 +42,7 @@ __all__ = [
     "OpenAISTTAdapter",
     "OpenAILLMAdapter",
     "OpenAITTSAdapter",
+    "VllmOmniTTSAdapter",
     "TelnyxLLMAdapter",
     "AzureSTTFastAdapter",
     "AzureSTTRealtimeAdapter",
@@ -48,4 +51,5 @@ __all__ = [
     "PipelineOrchestratorError",
     "PipelineUnavailableError",
     "PipelineResolution",
+    "resolve_channel_runtime_override",
 ]

@@ -12,6 +12,8 @@ PyYAML==6.0.3
 
 # Audio resampling (numpy linear interpolation for artifact-free streaming)
 numpy>=1.24.0
+# Stateful anti-aliasing resampling for opt-in DeepFilterNet3 streaming denoising
+soxr==1.0.0
 
 # Utilities
 tenacity==8.2.3

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Collection, Dict, Optional, Tuple
 from urllib.parse import urlparse
 
 from ..config import (
@@ -25,6 +25,7 @@ from ..config import (
     GoogleProviderConfig,
     GroqSTTProviderConfig,
     GroqTTSProviderConfig,
+    VllmOmniTTSProviderConfig,
     LocalProviderConfig,
     MiniMaxLLMProviderConfig,
     OpenAIProviderConfig,
@@ -40,6 +41,7 @@ from .local import LocalLLMAdapter, LocalSTTAdapter, LocalTTSAdapter
 from .ollama import OllamaLLMAdapter
 from .openai import OpenAISTTAdapter, OpenAILLMAdapter, OpenAITTSAdapter
 from .groq import GroqSTTAdapter, GroqTTSAdapter
+from .vllm_omni import VllmOmniTTSAdapter
 from .minimax import MiniMaxLLMAdapter
 from .telnyx import TelnyxLLMAdapter
 from .azure import AzureSTTFastAdapter, AzureSTTRealtimeAdapter, AzureTTSAdapter
@@ -49,6 +51,24 @@ logger = get_logger(__name__)
 
 ComponentFactory = Callable[[str, Dict[str, Any]], Component]
 _PLACEHOLDER_FACTORY_ATTR = "_ava_placeholder_role"
+
+
+def resolve_channel_runtime_override(
+    ai_pipeline_value: Optional[str],
+    ai_provider_value: Optional[str],
+    provider_names: Collection[str],
+) -> Tuple[str, Optional[str]]:
+    """Resolve per-call media selection without changing legacy provider semantics."""
+    pipeline_name = str(ai_pipeline_value or "").strip()
+    if pipeline_name:
+        return "pipeline", pipeline_name
+
+    provider_name = str(ai_provider_value or "").strip()
+    if not provider_name:
+        return "default", None
+    if provider_name in provider_names:
+        return "provider", provider_name
+    return "pipeline", provider_name
 
 
 class PipelineOrchestratorError(Exception):
@@ -247,6 +267,7 @@ class PipelineOrchestrator:
         self._cambai_provider_config: Optional[CambAiProviderConfig] = self._hydrate_cambai_config()
         self._groq_stt_provider_config: Optional[GroqSTTProviderConfig] = self._hydrate_groq_stt_config()
         self._groq_tts_provider_config: Optional[GroqTTSProviderConfig] = self._hydrate_groq_tts_config()
+        self._vllm_omni_tts_provider_config: Optional[VllmOmniTTSProviderConfig] = self._hydrate_vllm_omni_tts_config()
         self._azure_stt_provider_config: Optional[AzureSTTProviderConfig] = self._hydrate_azure_stt_config()
         self._azure_tts_provider_config: Optional[AzureTTSProviderConfig] = self._hydrate_azure_tts_config()
         self._register_builtin_factories()
@@ -620,6 +641,26 @@ class PipelineOrchestrator:
             )
         else:
             logger.debug("Groq TTS pipeline adapter not registered - API key unavailable or config missing")
+
+        if self._vllm_omni_tts_provider_config:
+            config_payload = self._vllm_omni_tts_provider_config.model_dump()
+
+            def vllm_omni_tts_factory(component_key: str, options: Dict[str, Any]) -> Component:
+                return VllmOmniTTSAdapter(
+                    component_key,
+                    self.config,
+                    VllmOmniTTSProviderConfig(**config_payload),
+                    options,
+                )
+
+            self.register_factory("vllm_omni_tts", vllm_omni_tts_factory)
+            logger.info(
+                "vLLM-Omni TTS pipeline adapter registered",
+                tts_factory="vllm_omni_tts",
+                model=self._vllm_omni_tts_provider_config.tts_model,
+            )
+        else:
+            logger.debug("vLLM-Omni TTS adapter not registered - provider disabled or missing")
 
         # ElevenLabs TTS adapter
         if self._elevenlabs_provider_config:
@@ -1413,6 +1454,24 @@ class PipelineOrchestrator:
             logger.warning("Groq TTS pipeline adapter requires GROQ_API_KEY; falling back to placeholder adapters")
             return None
 
+        return config
+
+    def _hydrate_vllm_omni_tts_config(self) -> Optional[VllmOmniTTSProviderConfig]:
+        providers = getattr(self.config, "providers", {}) or {}
+        raw_config = providers.get("vllm_omni_tts")
+        if not isinstance(raw_config, dict):
+            return None
+        try:
+            config = VllmOmniTTSProviderConfig(**raw_config)
+        except Exception as exc:
+            logger.warning("Failed to hydrate vLLM-Omni TTS provider config", error=str(exc))
+            return None
+        if not config.enabled:
+            return None
+        if not config.api_key:
+            config.api_key = os.getenv("VLLM_OMNI_API_KEY")
+        if not config.reference_auth_token:
+            config.reference_auth_token = os.getenv("VOICEAI_BACKEND_AUTH_TOKEN")
         return config
 
     def _make_groq_stt_factory(self, provider_config: GroqSTTProviderConfig) -> ComponentFactory:

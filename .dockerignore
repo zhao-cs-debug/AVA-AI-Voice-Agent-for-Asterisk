@@ -79,6 +79,16 @@ venv.bak/
 *.temp
 *.bak
 *.backup
+*.bak.*
+*.bak-*
+*.bak_*
+.codex-backups/
+.preflight-ok
+
+# Runtime customer configuration must never be baked into an image layer.
+config/contexts/cenani_*.yaml*
+data/*
+!data/.gitkeep
 
 # Audio files (testing artifacts)
 *.wav

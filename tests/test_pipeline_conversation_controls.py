@@ -1,4 +1,5 @@
 import asyncio
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -542,10 +543,55 @@ async def test_pipeline_energy_gate_falls_back_when_talkdetect_install_failed():
 
 
 @pytest.mark.asyncio
+async def test_pipeline_denoising_processes_different_calls_concurrently():
+    class ConcurrentDenoiser:
+        def __init__(self):
+            self.config = SimpleNamespace(enabled=False)
+            self.barrier = threading.Barrier(2)
+            self.lock = threading.Lock()
+            self.active = 0
+            self.max_active = 0
+
+        def process(self, _call_id, pcm16, _sample_rate):
+            with self.lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            try:
+                self.barrier.wait(timeout=0.5)
+            except threading.BrokenBarrierError:
+                pass
+            finally:
+                with self.lock:
+                    self.active -= 1
+            return pcm16
+
+        def take_unreported_failure(self, _call_id):
+            return None
+
+        def is_enhancing(self, _call_id):
+            return False
+
+    manager = ConcurrentDenoiser()
+    engine = Engine.__new__(Engine)
+    engine.realtime_denoiser = manager
+    first = CallSession(call_id="denoise-call-a", caller_channel_id="denoise-call-a")
+    second = CallSession(call_id="denoise-call-b", caller_channel_id="denoise-call-b")
+
+    outputs = await asyncio.gather(
+        engine._denoise_pipeline_stt_audio(first, b"first", 16000),
+        engine._denoise_pipeline_stt_audio(second, b"second", 16000),
+    )
+
+    assert outputs == [b"first", b"second"]
+    assert manager.max_active == 2
+
+
+@pytest.mark.asyncio
 async def test_audiosocket_pipeline_keeps_streaming_stt_input_during_tts_gate():
     call_id = "pipeline-full-duplex-stt"
     conn_id = "audio-connection"
     pcm16 = b"\x01\x00" * 320
+    denoised_pcm16 = b"\x02\x00" * 300
     session_store = SessionStore()
     session = CallSession(call_id=call_id, caller_channel_id=call_id, provider_name="pipeline")
     session.audio_capture_enabled = False
@@ -581,10 +627,19 @@ async def test_audiosocket_pipeline_keeps_streaming_stt_input_during_tts_gate():
     engine._pipeline_queues = {call_id: pipeline_queue}
     engine._resample_state_pipeline16k = {}
     engine._publish_audio_to_voiceai = AsyncMock()
+    engine._denoise_pipeline_stt_audio = AsyncMock(return_value=denoised_pcm16)
+    engine._maybe_start_pipeline_barge_in_from_pcm = AsyncMock(return_value=False)
 
     await engine._audiosocket_handle_audio(conn_id, pcm16)
 
-    assert pipeline_queue.get_nowait() == pcm16
+    assert pipeline_queue.get_nowait() == denoised_pcm16
+    engine._denoise_pipeline_stt_audio.assert_awaited_once_with(session, pcm16, 16000)
+    engine._maybe_start_pipeline_barge_in_from_pcm.assert_awaited_once_with(
+        session,
+        pcm16,
+        16000,
+        source="audiosocket",
+    )
     assert session.audio_capture_enabled is False
 
 
@@ -592,6 +647,7 @@ async def test_audiosocket_pipeline_keeps_streaming_stt_input_during_tts_gate():
 async def test_rtp_pipeline_queues_stt_before_running_interruption_gate():
     call_id = "rtp-full-duplex-stt"
     pcm16 = _pcm16_frame(1800)
+    denoised_pcm16 = _pcm16_frame(900)
     session_store = SessionStore()
     session = CallSession(call_id=call_id, caller_channel_id=call_id, provider_name="pipeline")
     session.audio_capture_enabled = False
@@ -610,6 +666,7 @@ async def test_rtp_pipeline_queues_stt_before_running_interruption_gate():
     engine._consume_attended_transfer_screening_audio = lambda *_args: False
     engine._session_has_pending_attended_transfer = lambda *_args: False
     engine._publish_audio_to_voiceai = AsyncMock()
+    engine._denoise_pipeline_stt_audio = AsyncMock(return_value=denoised_pcm16)
 
     async def observe_gate(*_args, **_kwargs):
         observed.append(pipeline_queue.get_nowait())
@@ -619,8 +676,11 @@ async def test_rtp_pipeline_queues_stt_before_running_interruption_gate():
 
     await engine._on_rtp_audio(call_id, 1234, pcm16)
 
-    assert observed == [pcm16]
+    assert observed == [denoised_pcm16]
+    engine._denoise_pipeline_stt_audio.assert_awaited_once_with(session, pcm16, 16000)
     engine._maybe_start_pipeline_barge_in_from_pcm.assert_awaited_once()
+    barge_args = engine._maybe_start_pipeline_barge_in_from_pcm.await_args
+    assert barge_args.args[:3] == (session, pcm16, 16000)
 
 
 @pytest.mark.asyncio

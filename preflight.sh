@@ -1621,6 +1621,101 @@ check_env() {
 }
 
 # ============================================================================
+# Optional realtime denoising runtime
+# ============================================================================
+check_realtime_denoise_runtime() {
+    local enabled
+    enabled="$(env_get "VOICEAI_DENOISE_ENABLED" "false" | tr '[:upper:]' '[:lower:]')"
+    case "$enabled" in
+        1|true|yes|on) ;;
+        *)
+            log_ok "Realtime denoising is disabled"
+            return 0
+            ;;
+    esac
+
+    log_info "Realtime denoising is enabled; validating runtime assets"
+
+    if grep -qE '^soxr([<=>~!].*)?$' "$SCRIPT_DIR/requirements.txt" 2>/dev/null; then
+        log_ok "Realtime denoising dependency is declared (soxr)"
+    else
+        log_fail "requirements.txt does not declare the soxr dependency"
+    fi
+
+    if grep -qE '[.]/models:/app/models([[:space:]]|$)' "$SCRIPT_DIR/docker-compose.yml" 2>/dev/null; then
+        log_ok "Realtime denoising model directory is mounted into ai_engine"
+    else
+        log_fail "docker-compose.yml does not mount ./models at /app/models"
+    fi
+
+    local library_container_path model_container_path
+    local library_sha256 model_sha256
+    library_container_path="$(env_get "VOICEAI_DENOISE_LIBRARY_PATH" "/app/models/libdf.so")"
+    model_container_path="$(env_get "VOICEAI_DENOISE_MODEL_PATH" "/app/models/DeepFilterNet3_onnx.tar.gz")"
+    library_sha256="$(env_get "VOICEAI_DENOISE_LIBRARY_SHA256" "96977141cfa48bd58ed0f90ecd576c5be868b4a1d0f554c8fd6219e9e0c088db")"
+    model_sha256="$(env_get "VOICEAI_DENOISE_MODEL_SHA256" "c94d91f70911001c946e0fabb4aa9adc37045f45a03b56008cb0c8244cb63616")"
+
+    local library_host_path model_host_path
+    case "$library_container_path" in
+        /app/models/*)
+            library_host_path="$SCRIPT_DIR/models/${library_container_path#/app/models/}"
+            ;;
+        *)
+            log_fail "VOICEAI_DENOISE_LIBRARY_PATH must be under /app/models for the default Compose mount"
+            library_host_path=""
+            ;;
+    esac
+    case "$model_container_path" in
+        /app/models/*)
+            model_host_path="$SCRIPT_DIR/models/${model_container_path#/app/models/}"
+            ;;
+        *)
+            log_fail "VOICEAI_DENOISE_MODEL_PATH must be under /app/models for the default Compose mount"
+            model_host_path=""
+            ;;
+    esac
+
+    verify_denoise_asset() {
+        local path="$1" expected="$2" label="$3"
+        if [ -z "$path" ]; then
+            return 1
+        fi
+        if [ ! -f "$path" ]; then
+            log_fail "$label is missing: $path"
+            return 1
+        fi
+        local size
+        size="$(wc -c < "$path" 2>/dev/null | tr -d ' ')"
+        if ! [[ "$size" =~ ^[0-9]+$ ]] || [ "$size" -lt 1024 ]; then
+            log_fail "$label is incomplete: $path"
+            return 1
+        fi
+        if [ -z "$expected" ]; then
+            log_fail "$label SHA256 is not configured"
+            return 1
+        fi
+
+        local actual=""
+        if command -v sha256sum >/dev/null 2>&1; then
+            actual="$(sha256sum "$path" 2>/dev/null | awk '{print $1}')"
+        elif command -v shasum >/dev/null 2>&1; then
+            actual="$(shasum -a 256 "$path" 2>/dev/null | awk '{print $1}')"
+        else
+            log_fail "sha256sum or shasum is required to validate $label"
+            return 1
+        fi
+        if [ "$actual" != "$expected" ]; then
+            log_fail "$label checksum mismatch: $path"
+            return 1
+        fi
+        log_ok "$label is present and checksum-verified"
+    }
+
+    verify_denoise_asset "$library_host_path" "$library_sha256" "DeepFilterNet library"
+    verify_denoise_asset "$model_host_path" "$model_sha256" "DeepFilterNet model"
+}
+
+# ============================================================================
 # Asterisk Detection
 # ============================================================================
 _json_escape() {
@@ -2553,6 +2648,7 @@ apply_fixes() {
         check_secrets_permissions >/dev/null 2>&1
         check_selinux >/dev/null 2>&1
         check_env >/dev/null 2>&1
+        check_realtime_denoise_runtime >/dev/null 2>&1
         check_docker_gid >/dev/null 2>&1
     fi
 }
@@ -2731,6 +2827,7 @@ main() {
     check_secrets_permissions  # AAVA-191: Vertex AI credentials directory
     check_selinux
     check_env
+    check_realtime_denoise_runtime
     check_host_project_root
     check_network
 

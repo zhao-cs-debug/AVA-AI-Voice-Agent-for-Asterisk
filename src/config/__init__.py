@@ -38,6 +38,7 @@ MiniMaxLLMProviderConfig = _parent_config.MiniMaxLLMProviderConfig
 GoogleProviderConfig = _parent_config.GoogleProviderConfig
 GroqSTTProviderConfig = _parent_config.GroqSTTProviderConfig
 GroqTTSProviderConfig = _parent_config.GroqTTSProviderConfig
+VllmOmniTTSProviderConfig = _parent_config.VllmOmniTTSProviderConfig
 ElevenLabsProviderConfig = _parent_config.ElevenLabsProviderConfig
 CambAiProviderConfig = _parent_config.CambAiProviderConfig
 OpenAIRealtimeProviderConfig = _parent_config.OpenAIRealtimeProviderConfig
@@ -72,6 +73,7 @@ __all__ = [
     'GoogleProviderConfig',
     'GroqSTTProviderConfig',
     'GroqTTSProviderConfig',
+    'VllmOmniTTSProviderConfig',
     'ElevenLabsProviderConfig',
     'CambAiProviderConfig',
     'OpenAIRealtimeProviderConfig',

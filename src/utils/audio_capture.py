@@ -203,6 +203,7 @@ class CustomerAudioCaptureManager:
         called_number: Optional[str],
         pcm16: bytes,
         sample_rate: int,
+        stream_name: str = "customer",
     ) -> bool:
         if not self.enabled or self._capture is None or not pcm16:
             return False
@@ -212,7 +213,7 @@ class CustomerAudioCaptureManager:
         }
         if not self.caller_allowlist.intersection(identifiers):
             return False
-        self._capture.append_pcm16(call_id, "customer", pcm16, sample_rate)
+        self._capture.append_pcm16(call_id, stream_name, pcm16, sample_rate)
         return True
 
     def close_call(self, call_id: str) -> None:

@@ -57,11 +57,13 @@ from .pipelines import (
     PipelineOrchestratorError,
     PipelineResolution,
     PipelineUnavailableError,
+    resolve_channel_runtime_override,
 )
 from .logging_config import get_logger, configure_logging
 from .rtp_server import RTPServer
 from .audio.audiosocket_server import AudioSocketServer
 from .audio.resampler import resample_audio
+from .audio.realtime_denoiser import RealtimeDenoiserManager
 from .providers.base import AIProviderInterface
 from .providers.deepgram import DeepgramProvider
 from .providers.local import LocalProvider
@@ -432,6 +434,14 @@ class Engine:
             enabled=self.customer_audio_capture.enabled,
             caller_allowlist=sorted(self.customer_audio_capture.caller_allowlist),
             base_dir=self.customer_audio_capture.base_dir,
+        )
+        self.realtime_denoiser = RealtimeDenoiserManager.from_environment()
+        logger.info(
+            "Realtime denoiser configured",
+            enabled=self.realtime_denoiser.config.enabled,
+            provider=self.realtime_denoiser.config.provider,
+            context_allowlist=self.realtime_denoiser.config.context_allowlist,
+            stt_allowlist=self.realtime_denoiser.config.stt_allowlist,
         )
         self.streaming_playback_manager = StreamingPlaybackManager(
             self.session_store,
@@ -3497,37 +3507,43 @@ class Engine:
             except Exception:
                 logger.debug("Audio profile resolution failed", call_id=caller_channel_id, exc_info=True)
 
-            # Per-call override via Asterisk channel var AI_PROVIDER.
-            # Values:
-            #   - openai_realtime | deepgram → full agent override
-            #   - customX (any other token) → pipeline name
+            # AI_PIPELINE selects a modular media pipeline without changing the
+            # product/runtime identity carried by AI_PROVIDER.
+            ai_pipeline_value = None
             ai_provider_value = None
-            try:
-                resp = await self.ari_client.send_command(
-                    "GET",
-                    f"channels/{caller_channel_id}/variable",
-                    params={"variable": "AI_PROVIDER"},
-                )
-                if isinstance(resp, dict):
-                    ai_provider_value = (resp.get("value") or "").strip()
-            except Exception:
-                logger.debug(
-                    "AI_PROVIDER read failed; continuing with defaults",
-                    channel_id=caller_channel_id,
-                    exc_info=True,
-                )
+            for variable_name in ("AI_PIPELINE", "AI_PROVIDER"):
+                try:
+                    resp = await self.ari_client.send_command(
+                        "GET",
+                        f"channels/{caller_channel_id}/variable",
+                        params={"variable": variable_name},
+                    )
+                    value = (resp.get("value") or "").strip() if isinstance(resp, dict) else ""
+                    if variable_name == "AI_PIPELINE":
+                        ai_pipeline_value = value
+                    else:
+                        ai_provider_value = value
+                except Exception:
+                    logger.debug(
+                        "%s read failed; continuing with defaults",
+                        variable_name,
+                        channel_id=caller_channel_id,
+                        exc_info=True,
+                    )
 
-            resolved_provider = (
-                ai_provider_value if ai_provider_value else None
+            override_mode, override_value = resolve_channel_runtime_override(
+                ai_pipeline_value,
+                ai_provider_value,
+                self.providers.keys(),
             )
 
             pipeline_resolution = None
-            if resolved_provider and resolved_provider in self.providers:
+            if override_mode == "provider" and override_value:
                 # Full agent override for this call
                 previous = session.provider_name
-                self._assign_session_provider(session, resolved_provider)
+                self._assign_session_provider(session, override_value)
                 # Re-evaluate per-provider VAD decision after provider change
-                use_local = self._should_use_local_vad(resolved_provider)
+                use_local = self._should_use_local_vad(override_value)
                 session.enhanced_vad_enabled = bool(self.vad_manager) and use_local
                 await self._save_session(session)
                 logger.info(
@@ -3535,21 +3551,28 @@ class Engine:
                     channel_id=caller_channel_id,
                     variable="AI_PROVIDER",
                     value=ai_provider_value,
-                    resolved_provider=resolved_provider,
+                    resolved_provider=override_value,
                     previous_provider=previous,
                     resolved_mode="full_agent",
                 )
-            elif ai_provider_value:
+            elif override_mode == "pipeline" and override_value:
                 # Treat as a pipeline name for this call
-                pipeline_resolution = await self._assign_pipeline_to_session(
-                    session, pipeline_name=ai_provider_value
-                )
+                strict_pipeline = bool(ai_pipeline_value)
+                try:
+                    pipeline_resolution = await self._assign_pipeline_to_session(
+                        session,
+                        pipeline_name=override_value,
+                        strict=strict_pipeline,
+                    )
+                except PipelineOrchestratorError as exc:
+                    await self._handle_pipeline_runner_failure(caller_channel_id, exc)
+                    raise
                 if pipeline_resolution:
                     logger.info(
                         "AI pipeline selection applied from channel variable",
                         channel_id=caller_channel_id,
-                        variable="AI_PROVIDER",
-                        value=ai_provider_value,
+                        variable="AI_PIPELINE" if strict_pipeline else "AI_PROVIDER",
+                        value=override_value,
                         pipeline=pipeline_resolution.pipeline_name,
                         components=pipeline_resolution.component_summary(),
                         resolved_mode="pipeline",
@@ -3563,7 +3586,7 @@ class Engine:
                     logger.warning(
                         "Requested pipeline via AI_PROVIDER not found; falling back",
                         channel_id=caller_channel_id,
-                        requested_pipeline=ai_provider_value,
+                        requested_pipeline=override_value,
                     )
                     pipeline_resolution = await self._assign_pipeline_to_session(session)
             else:
@@ -4077,6 +4100,7 @@ class Engine:
             getattr(self, "_pipeline_queues", {}).pop(session.call_id, None)
             getattr(self, "_pipeline_transcript_queues", {}).pop(session.call_id, None)
             self._pipeline_forced.pop(session.call_id, None)
+            await self._close_realtime_denoiser(session.call_id)
         except Exception:
             pass
         provider = self._call_providers.pop(session.call_id, None)
@@ -5336,6 +5360,7 @@ class Engine:
             getattr(self, "_pipeline_queues", {}).pop(call_id, None)
             getattr(self, "_pipeline_transcript_queues", {}).pop(call_id, None)
             self._pipeline_forced.pop(call_id, None)
+            await self._close_realtime_denoiser(call_id)
         except Exception:
             pass
         provider = self._call_providers.pop(call_id, None)
@@ -6792,6 +6817,7 @@ class Engine:
 
     async def _stop_pipeline_runtime_for_cleanup(self, session: CallSession, call_id: str) -> None:
         self._mark_pipeline_call_terminating(call_id, reason="call-terminated")
+        await self._close_realtime_denoiser(call_id)
         task = self._pipeline_tasks.pop(call_id, None)
         if task and task is not asyncio.current_task():
             task.cancel()
@@ -7842,17 +7868,21 @@ class Engine:
                             except (TypeError, ValueError, IndexError):
                                 pcm16 = pcm_bytes
                         if pcm16:
-                            q.put_nowait(pcm16)
-                            try:
-                                await self._publish_audio_to_voiceai(
-                                    caller_channel_id,
-                                    pcm16,
-                                    role="user",
-                                    encoding="slin",
-                                    sample_rate=16000,
-                                )
-                            except Exception:
-                                logger.debug("VoiceAI user audio publish failed (AudioSocket/pipeline)", call_id=caller_channel_id, exc_info=True)
+                            stt_pcm16 = await self._denoise_pipeline_stt_audio(
+                                session, pcm16, 16000
+                            )
+                            if stt_pcm16:
+                                q.put_nowait(stt_pcm16)
+                                try:
+                                    await self._publish_audio_to_voiceai(
+                                        caller_channel_id,
+                                        stt_pcm16,
+                                        role="user",
+                                        encoding="slin",
+                                        sample_rate=16000,
+                                    )
+                                except Exception:
+                                    logger.debug("VoiceAI user audio publish failed (AudioSocket/pipeline)", call_id=caller_channel_id, exc_info=True)
                     except asyncio.QueueFull:
                         logger.debug("Pipeline queue full; dropping AudioSocket frame", call_id=caller_channel_id)
                 else:
@@ -9733,21 +9763,25 @@ class Engine:
                 q = self._pipeline_queues.get(caller_channel_id)
                 if q:
                     try:
-                        q.put_nowait(pcm_16k)  # Pipeline expects PCM16@16kHz
-                        try:
-                            await self._publish_audio_to_voiceai(
-                                caller_channel_id,
-                                pcm_16k,
-                                role="user",
-                                encoding="slin",
-                                sample_rate=16000,
-                            )
-                        except Exception:
-                            logger.debug(
-                                "VoiceAI user audio publish failed (RTP/pipeline)",
-                                call_id=caller_channel_id,
-                                exc_info=True,
-                            )
+                        stt_pcm16 = await self._denoise_pipeline_stt_audio(
+                            session, pcm_16k, 16000
+                        )
+                        if stt_pcm16:
+                            q.put_nowait(stt_pcm16)  # Pipeline expects PCM16@16kHz
+                            try:
+                                await self._publish_audio_to_voiceai(
+                                    caller_channel_id,
+                                    stt_pcm16,
+                                    role="user",
+                                    encoding="slin",
+                                    sample_rate=16000,
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "VoiceAI user audio publish failed (RTP/pipeline)",
+                                    call_id=caller_channel_id,
+                                    exc_info=True,
+                                )
                         logger.debug(
                             "RTP audio routed to pipeline queue",
                             call_id=caller_channel_id,
@@ -12667,6 +12701,31 @@ class Engine:
         # transcripts before _pipeline_runner reaches its own queue setup.
         self._pipeline_transcript_queues.setdefault(call_id, asyncio.Queue(maxsize=64))
         self._pipeline_forced[call_id] = bool(forced)
+        try:
+            resolution = self.pipeline_orchestrator.get_pipeline(
+                call_id, getattr(session, "pipeline_name", None)
+            )
+            if resolution and getattr(self, "realtime_denoiser", None):
+                opened = await asyncio.to_thread(
+                    self.realtime_denoiser.open_call,
+                    call_id,
+                    context_name=getattr(session, "context_name", None),
+                    stt_key=getattr(resolution, "stt_key", None),
+                )
+                if opened:
+                    logger.info(
+                        "Realtime denoiser opened for development call",
+                        call_id=call_id,
+                        context_name=getattr(session, "context_name", None),
+                        stt_key=getattr(resolution, "stt_key", None),
+                    )
+                self._log_realtime_denoiser_failure(call_id)
+        except Exception:
+            logger.warning(
+                "Realtime denoiser unavailable; caller audio will pass through",
+                call_id=call_id,
+                exc_info=True,
+            )
         # Pipelines: enable Asterisk talk detection so barge-in can trigger even when
         # ExternalMedia RTP delivery is paused/altered during channel playback.
         try:
@@ -12676,6 +12735,92 @@ class Engine:
         task = asyncio.create_task(self._pipeline_runner(call_id), name=f"pipeline-runner-{call_id}")
         self._pipeline_tasks[call_id] = task
         logger.info("Pipeline runner started", call_id=call_id, pipeline=session.pipeline_name)
+
+    async def _denoise_pipeline_stt_audio(
+        self, session: CallSession, pcm16: bytes, sample_rate: int = 16000
+    ) -> bytes:
+        manager = getattr(self, "realtime_denoiser", None)
+        if not manager or not pcm16:
+            return pcm16
+        if manager.config.enabled and manager.should_attempt_open(session.call_id):
+            try:
+                resolution = self.pipeline_orchestrator.get_pipeline(
+                    session.call_id, getattr(session, "pipeline_name", None)
+                )
+                await asyncio.to_thread(
+                    manager.open_call,
+                    session.call_id,
+                    context_name=getattr(session, "context_name", None),
+                    stt_key=getattr(resolution, "stt_key", None) if resolution else None,
+                )
+                self._log_realtime_denoiser_failure(session.call_id)
+            except Exception:
+                logger.debug(
+                    "Deferred realtime denoiser open failed",
+                    call_id=session.call_id,
+                    exc_info=True,
+                )
+        output = await asyncio.to_thread(
+            manager.process,
+            session.call_id,
+            pcm16,
+            sample_rate,
+        )
+        self._log_realtime_denoiser_failure(session.call_id)
+        if output and manager.is_enhancing(session.call_id):
+            try:
+                self.customer_audio_capture.append_pcm16(
+                    call_id=session.call_id,
+                    caller_number=getattr(session, "caller_number", None),
+                    called_number=getattr(session, "called_number", None),
+                    pcm16=output,
+                    sample_rate=sample_rate,
+                    stream_name="customer_denoised",
+                )
+            except Exception:
+                logger.debug(
+                    "Denoised customer audio capture failed",
+                    call_id=session.call_id,
+                    exc_info=True,
+                )
+        return output
+
+    def _log_realtime_denoiser_failure(self, call_id: str) -> None:
+        manager = getattr(self, "realtime_denoiser", None)
+        if not manager:
+            return
+        reason = manager.take_unreported_failure(call_id)
+        if reason:
+            logger.warning(
+                "Realtime denoiser failed open; caller audio will pass through",
+                call_id=call_id,
+                error=reason,
+            )
+
+    async def _close_realtime_denoiser(self, call_id: str) -> None:
+        manager = getattr(self, "realtime_denoiser", None)
+        if not manager:
+            return
+        try:
+            stats = await asyncio.to_thread(manager.close_call, call_id)
+            if stats:
+                chunks = int(stats.get("processed_chunks", 0) or 0)
+                total_ms = float(stats.get("processing_ms_total", 0.0) or 0.0)
+                logger.info(
+                    "Realtime denoiser closed",
+                    call_id=call_id,
+                    processed_chunks=chunks,
+                    mean_processing_ms=round(total_ms / chunks, 3) if chunks else 0.0,
+                    fallback_count=int(stats.get("fallback_count", 0) or 0),
+                    disabled=bool(stats.get("disabled", False)),
+                    last_error=stats.get("last_error"),
+                )
+        except Exception:
+            logger.debug(
+                "Realtime denoiser cleanup failed",
+                call_id=call_id,
+                exc_info=True,
+            )
 
     async def _resolve_pipeline_runner_context(
         self, call_id: str
@@ -16071,11 +16216,17 @@ class Engine:
         self,
         session: CallSession,
         pipeline_name: Optional[str] = None,
+        *,
+        strict: bool = False,
     ) -> Optional[PipelineResolution]:
         """Resolve modular pipeline components for a session and persist metadata."""
         if not getattr(self, "pipeline_orchestrator", None):
+            if strict:
+                raise PipelineUnavailableError(str(pipeline_name), "pipeline orchestrator is unavailable")
             return None
         if not self.pipeline_orchestrator.enabled:
+            if strict:
+                raise PipelineUnavailableError(str(pipeline_name), "pipeline orchestrator is disabled")
             return None
         # If a monolithic provider is selected for this session (e.g., google_live),
         # do not auto-attach the active pipeline unless explicitly requested.
@@ -16094,6 +16245,8 @@ class Engine:
                 error=str(exc),
                 exc_info=True,
             )
+            if strict:
+                raise
             return None
         except Exception as exc:
             logger.error(
@@ -16106,6 +16259,8 @@ class Engine:
             return None
  
         if not resolution:
+            if strict:
+                raise PipelineUnavailableError(str(pipeline_name), "pipeline orchestrator is not ready")
             logger.debug(
                 "Pipeline orchestrator returned no resolution",
                 call_id=session.call_id,

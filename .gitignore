@@ -180,6 +180,17 @@ test_piper.py
 *.temp
 *.bak
 *.backup
+*.bak.*
+*.bak-*
+*.bak_*
+.env.bak*
+.codex-backups/
+.preflight-ok
+
+# Runtime customer configuration and generated state stay on the host.
+config/contexts/cenani_*.yaml*
+data/*
+!data/.gitkeep
 
 # Audio files (generated during testing)
 *.wav

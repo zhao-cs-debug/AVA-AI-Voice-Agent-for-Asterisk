@@ -432,6 +432,27 @@ class GroqTTSProviderConfig(BaseModel):
     request_timeout_sec: float = Field(default=15.0)
 
 
+class VllmOmniTTSProviderConfig(BaseModel):
+    """VoxCPM2 served by vLLM-Omni's OpenAI-compatible speech API."""
+
+    enabled: bool = Field(default=False)
+    api_key: Optional[str] = None
+    tts_base_url: str = Field(default="http://127.0.0.1:18091/v1/audio/speech")
+    tts_model: str = Field(default="openbmb/VoxCPM2")
+    voice: str = Field(default="default")
+    response_format: str = Field(default="pcm")
+    source_sample_rate_hz: int = Field(default=48000)
+    target_encoding: str = Field(default="mulaw")
+    target_sample_rate_hz: int = Field(default=8000)
+    chunk_size_ms: int = Field(default=20, ge=10, le=1000)
+    connect_timeout_sec: float = Field(default=5.0, gt=0)
+    request_timeout_sec: float = Field(default=90.0, gt=0)
+    reference_base_url: Optional[str] = None
+    reference_auth_token: Optional[str] = None
+    reference_timeout_sec: float = Field(default=10.0, gt=0)
+    reference_cache_ttl_sec: float = Field(default=300.0, ge=0)
+
+
 class ElevenLabsProviderConfig(BaseModel):
     """ElevenLabs TTS provider configuration.
 
