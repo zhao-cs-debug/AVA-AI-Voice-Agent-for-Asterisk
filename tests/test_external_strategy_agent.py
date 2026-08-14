@@ -187,7 +187,6 @@ async def test_start_session_runs_full_http_lifecycle_and_uses_returned_worker_u
 
     provider = ExternalStrategyAgentProvider(provider_config(), on_event)
     request = AsyncMock(side_effect=[
-        {"ok": True},
         {
             "session_id": "session-1",
             "settings_url": "https://strategy.example/settings/session-1",
@@ -236,21 +235,24 @@ async def test_start_session_runs_full_http_lifecycle_and_uses_returned_worker_u
 
     await provider.start_session("call-1", context=provider_context())
 
-    assert request.await_args_list[0].args[:2] == ("GET", "/__service/health")
-    assert request.await_args_list[1].args[:2] == ("POST", "/api/v1/external/sessions")
-    assert request.await_args_list[1].kwargs["payload"]["mode"] == "voice"
-    assert request.await_args_list[2].args[:2] == (
+    assert request.await_args_list[0].args[:2] == ("POST", "/api/v1/external/sessions")
+    assert request.await_args_list[0].kwargs["payload"]["mode"] == "voice"
+    assert all(
+        call.args[:2] != ("GET", "/__service/health")
+        for call in request.await_args_list
+    )
+    assert request.await_args_list[1].args[:2] == (
         "PUT",
         "https://strategy.example/settings/session-1",
     )
-    settings_payload = request.await_args_list[2].kwargs["payload"]
+    settings_payload = request.await_args_list[1].kwargs["payload"]
     assert settings_payload["network"] == {"mode": "existing", "id": "network-016"}
     assert settings_payload["human"]["background"] == "客户背景"
-    assert request.await_args_list[3].args[:2] == (
+    assert request.await_args_list[2].args[:2] == (
         "GET",
         "/api/tts/voices?conn_id=session-1",
     )
-    saved = request.await_args_list[4].kwargs["payload"]["settings"]
+    saved = request.await_args_list[3].kwargs["payload"]["settings"]
     assert saved["preserve_me"] == "yes"
     assert saved["qwen3_voice_uuid"] == "voice-2"
     assert "legacy_field" not in saved
@@ -271,7 +273,6 @@ async def test_start_session_runs_full_http_lifecycle_and_uses_returned_worker_u
 async def test_start_session_keeps_server_voice_when_catalog_has_no_choices():
     provider = ExternalStrategyAgentProvider(provider_config(), AsyncMock())
     request = AsyncMock(side_effect=[
-        {"ok": True},
         {
             "session_id": "session-empty-catalog",
             "settings_url": "/api/v1/external/sessions/session-empty-catalog/settings",
@@ -307,7 +308,11 @@ async def test_start_session_keeps_server_voice_when_catalog_has_no_choices():
 
     await provider.start_session("call-empty-catalog", context=provider_context())
 
-    assert request.await_count == 4
+    assert request.await_count == 3
+    assert request.await_args_list[0].args[:2] == (
+        "POST",
+        "/api/v1/external/sessions",
+    )
     provider._connect_websocket.assert_awaited_once_with(
         "wss://strategy.example/api/v1/external/sessions/session-empty-catalog/stream"
     )

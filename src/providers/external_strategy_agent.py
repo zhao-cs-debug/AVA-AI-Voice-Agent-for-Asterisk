@@ -100,7 +100,6 @@ class ExternalStrategyAgentProvider(AIProviderInterface, ProviderCapabilitiesMix
         if on_event:
             self.on_event = on_event
         await self._reset_session(call_id)
-        await self._check_service_health()
         external = self._validated_context(context or {})
         audio = external["audio"]
         self._input_rate = int(audio["input_sample_rate"])
@@ -316,15 +315,6 @@ class ExternalStrategyAgentProvider(AIProviderInterface, ProviderCapabilitiesMix
         if not isinstance(decoded, dict):
             raise ExternalStrategyProtocolError("External strategy response must be an object")
         return decoded
-
-    async def _check_service_health(self) -> None:
-        health = await self._request_json(
-            "GET",
-            "/__service/health",
-            timeout=min(float(self.config.request_timeout_sec), 30.0),
-        )
-        if health.get("ok") is not True:
-            raise ExternalStrategyProtocolError("External strategy service is not healthy")
 
     @staticmethod
     def _require_same_worker(expected: str, actual: str, operation: str) -> None:
